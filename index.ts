@@ -22,7 +22,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Text } from "@earendil-works/pi-tui";
 import { Type, type TSchema } from "typebox";
 import { constants as fsConstants, copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -1203,8 +1203,21 @@ export function createHerdrSubagentsExtension(
     expansionParamKeys: ["model", "thinking", ...Object.keys(extraSpawnParams)],
   };
 
+  function normalizeProviderPath(path: string | undefined): string {
+    if (!path) return "";
+    try {
+      return path.startsWith("file:") ? fileURLToPath(path) : resolve(path);
+    } catch {
+      return path;
+    }
+  }
+
   function isOwnSubagentProvider(path: string | undefined): boolean {
-    return path === MODULE_PATH || providerEntryPaths.includes(path ?? "");
+    const normalized = normalizeProviderPath(path);
+    if (normalized === MODULE_PATH) return true;
+    return providerEntryPaths.some(
+      (entryPath) => normalizeProviderPath(entryPath) === normalized,
+    );
   }
 
   return function herdrSubagents(pi: ExtensionAPI) {

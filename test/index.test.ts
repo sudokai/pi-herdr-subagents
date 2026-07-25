@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-import herdrSubagents, { __test__ } from "../index.ts";
+import herdrSubagents, { __test__, createHerdrSubagentsExtension } from "../index.ts";
 import { getActiveSubagentCount } from "../src/runtime-state.ts";
 import type { SubagentOutcome } from "../src/watcher.ts";
 
@@ -292,6 +292,26 @@ describe("index: activation guard", () => {
     herdrSubagents(fake.api);
 
     fake.setAllTools([{ name: "subagent", sourceInfo: { path: INDEX_PATH } }]);
+    const { ctx, notifications } = makeFakeCtx();
+    fake.fire("session_start", {}, ctx);
+
+    assert.deepEqual(
+      notifications.filter((n) => n.type === "warning"),
+      [],
+    );
+  });
+
+  it("wrapper providerEntryPaths accept file:// URLs and filesystem paths", () => {
+    envInsideHerdr();
+    __test__.setDeps({ client: makeFakeClient() });
+    const wrapperPath = resolve(dirname(INDEX_PATH), "extensions", "subagent.ts");
+    const wrapper = createHerdrSubagentsExtension({
+      providerEntryPaths: [pathToFileURL(wrapperPath).href],
+    });
+    const fake = createFakePi();
+    wrapper(fake.api);
+
+    fake.setAllTools([{ name: "subagent", sourceInfo: { path: wrapperPath } }]);
     const { ctx, notifications } = makeFakeCtx();
     fake.fire("session_start", {}, ctx);
 
