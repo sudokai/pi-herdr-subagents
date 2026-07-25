@@ -92,7 +92,6 @@ describe("agents.ts", () => {
         "thinking: high",
         "deny-tools: web_search",
         "spawning: false",
-        "auto-exit: true",
         "interactive: false",
         "session-mode: fork",
         "cwd: sub/dir",
@@ -114,7 +113,6 @@ describe("agents.ts", () => {
       assert.equal(parsed.thinking, "high");
       assert.equal(parsed.denyTools, "web_search");
       assert.equal(parsed.spawning, false);
-      assert.equal(parsed.autoExit, true);
       assert.equal(parsed.interactive, false);
       assert.equal(parsed.sessionMode, "fork");
       assert.equal(parsed.cwd, "sub/dir");
@@ -368,23 +366,16 @@ describe("agents.ts", () => {
   });
 
   describe("resolveEffectiveInteractive", () => {
-    it("defaults to the inverse of auto-exit", () => {
-      // Autonomous agents (auto-exit: true) are NOT interactive — parent gets stall pings.
-      assert.equal(resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: true }), false);
-      // Agents without auto-exit ARE interactive — parent does not receive status transition pings.
-      assert.equal(resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: false }), true);
-      assert.equal(resolveEffectiveInteractive({ name: "A", task: "T" }, {}), true);
-      // Bare spawn with no agent defs (e.g. /iterate fork) is interactive by default.
-      assert.equal(resolveEffectiveInteractive({ name: "A", task: "T" }, null), true);
+    it("defaults to non-interactive", () => {
+      assert.equal(resolveEffectiveInteractive({ name: "A", task: "T" }, null), false);
+      assert.equal(resolveEffectiveInteractive({ name: "A", task: "T" }, {}), false);
     });
 
-    it("honors explicit frontmatter over the auto-exit default", () => {
-      // Autonomous agent that still wants to be treated as interactive.
+    it("honors explicit frontmatter", () => {
       assert.equal(
-        resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: true, interactive: true }),
+        resolveEffectiveInteractive({ name: "A", task: "T" }, { interactive: true }),
         true,
       );
-      // Non-auto-exit agent that opts back into stall pings.
       assert.equal(
         resolveEffectiveInteractive({ name: "A", task: "T" }, { interactive: false }),
         false,
@@ -395,14 +386,14 @@ describe("agents.ts", () => {
       assert.equal(
         resolveEffectiveInteractive(
           { name: "A", task: "T", interactive: false },
-          { autoExit: false, interactive: true },
+          { interactive: true },
         ),
         false,
       );
       assert.equal(
         resolveEffectiveInteractive(
           { name: "A", task: "T", interactive: true },
-          { autoExit: true, interactive: false },
+          { interactive: false },
         ),
         true,
       );
@@ -411,7 +402,7 @@ describe("agents.ts", () => {
 
   describe("resolveEffectiveSessionMode / resolveLaunchBehavior", () => {
     it("resolves session mode with fork override precedence", () => {
-      assert.equal(resolveEffectiveSessionMode({ name: "A", task: "T" }, null), "standalone");
+      assert.equal(resolveEffectiveSessionMode({ name: "A", task: "T" }, null), "lineage-only");
       assert.equal(
         resolveEffectiveSessionMode({ name: "A", task: "T" }, { sessionMode: "lineage-only" }),
         "lineage-only",
@@ -425,10 +416,9 @@ describe("agents.ts", () => {
       );
     });
 
-    it("resolves launch behavior for standalone, lineage-only, and fork modes", () => {
+    it("resolves launch behavior for lineage-only and fork modes", () => {
       assert.deepEqual(resolveLaunchBehavior({ name: "A", task: "T" }, null), {
-        sessionMode: "standalone",
-        seededSessionMode: null,
+        sessionMode: "lineage-only",
         inheritsConversationContext: false,
         taskDelivery: "artifact",
       });
@@ -436,14 +426,12 @@ describe("agents.ts", () => {
         resolveLaunchBehavior({ name: "A", task: "T" }, { sessionMode: "lineage-only" }),
         {
           sessionMode: "lineage-only",
-          seededSessionMode: "lineage-only",
           inheritsConversationContext: false,
           taskDelivery: "artifact",
         },
       );
       assert.deepEqual(resolveLaunchBehavior({ name: "A", task: "T" }, { sessionMode: "fork" }), {
         sessionMode: "fork",
-        seededSessionMode: "fork",
         inheritsConversationContext: true,
         taskDelivery: "direct",
       });
@@ -451,7 +439,6 @@ describe("agents.ts", () => {
         resolveLaunchBehavior({ name: "A", task: "T", fork: true }, { sessionMode: "lineage-only" }),
         {
           sessionMode: "fork",
-          seededSessionMode: "fork",
           inheritsConversationContext: true,
           taskDelivery: "direct",
         },

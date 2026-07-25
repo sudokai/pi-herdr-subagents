@@ -185,6 +185,7 @@ describe("subagent-done: subagent_done tool writes sidecar and shuts down", () =
     const fakePi = {
       on: () => {},
       registerTool: (tool: any) => { registeredTools[tool.name] = tool; },
+      registerCommand: () => {},
       registerShortcut: () => {},
       getAllTools: () => [],
     };
@@ -242,6 +243,7 @@ describe("subagent-done: user close without subagent_done leaves no sidecar", ()
     const fakePi = {
       on: (event: string, handler: Function) => { handlers[event] = handler; },
       registerTool: () => {},
+      registerCommand: () => {},
       registerShortcut: () => {},
       getAllTools: () => [],
     };
@@ -292,6 +294,7 @@ describe("subagent-done: session_shutdown context usage fallback", () => {
     const fakePi = {
       on: (event: string, handler: Function) => { handlers[event] = handler; },
       registerTool: () => {},
+      registerCommand: () => {},
       registerShortcut: () => {},
       getAllTools: () => [],
     };
@@ -334,6 +337,7 @@ describe("subagent-done: session_shutdown context usage fallback", () => {
     const fakePi = {
       on: (event: string, handler: Function) => { handlers[event] = handler; },
       registerTool: () => {},
+      registerCommand: () => {},
       registerShortcut: () => {},
       getAllTools: () => [],
     };
@@ -370,6 +374,7 @@ describe("subagent-done: agent_end writes .exit sidecar on clean auto-exit", () 
     const fakePi = {
       on: (event: string, handler: Function) => { handlers[event] = handler; },
       registerTool: () => {},
+      registerCommand: () => {},
       registerShortcut: () => {},
       getAllTools: () => [],
     };
@@ -414,6 +419,7 @@ describe("subagent-done: agent_end writes .exit sidecar on clean auto-exit", () 
     const fakePi = {
       on: (event: string, handler: Function) => { handlers[event] = handler; },
       registerTool: () => {},
+      registerCommand: () => {},
       registerShortcut: () => {},
       getAllTools: () => [],
     };
@@ -458,6 +464,7 @@ describe("subagent-done: agent_end writes .exit sidecar on clean auto-exit", () 
     const fakePi = {
       on: (event: string, handler: Function) => { handlers[event] = handler; },
       registerTool: () => {},
+      registerCommand: () => {},
       registerShortcut: () => {},
       getAllTools: () => [],
     };

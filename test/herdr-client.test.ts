@@ -23,22 +23,24 @@ function fakeExec(responses: Array<{ stdout?: string; stderr?: string; code?: nu
   return { exec, calls };
 }
 
-const agentStartedEnvelope = JSON.stringify({
-  id: "cli:agent:start",
+const paneSplitEnvelope = JSON.stringify({
+  id: "cli:pane:split",
   result: {
-    agent: {
+    pane: {
       pane_id: "w1:p2",
       terminal_id: "term_abc123",
       workspace_id: "w1",
       tab_id: "w1:t1",
     },
-    type: "agent_started",
   },
 });
 
 describe("HerdrClient", () => {
-  it("agentStart builds correct argv", async () => {
-    const { exec, calls } = fakeExec([{ stdout: agentStartedEnvelope }]);
+  it("agentStart splits pane then runs argv", async () => {
+    const { exec, calls } = fakeExec([
+      { stdout: paneSplitEnvelope },
+      { stdout: "" },
+    ]);
     const client = createHerdrClient({ exec });
 
     const result = await client.agentStart({
@@ -49,23 +51,19 @@ describe("HerdrClient", () => {
       argv: ["bash", "/tmp/launch.sh"],
     });
 
-    assert.equal(calls.length, 1);
+    assert.equal(calls.length, 2);
     assert.equal(calls[0].cmd, "herdr");
     assert.deepEqual(calls[0].args, [
-      "agent",
-      "start",
-      "worker-1",
+      "pane",
+      "split",
+      "--current",
+      "--direction",
+      "right",
       "--cwd",
       "/tmp/project",
-      "--tab",
-      "w1:t1",
-      "--split",
-      "right",
       "--no-focus",
-      "--",
-      "bash",
-      "/tmp/launch.sh",
     ]);
+    assert.deepEqual(calls[1].args, ["pane", "run", "w1:p2", "bash", "/tmp/launch.sh"]);
     assert.deepEqual(result, {
       paneId: "w1:p2",
       terminalId: "term_abc123",
@@ -74,8 +72,11 @@ describe("HerdrClient", () => {
     });
   });
 
-  it("agentStart passes env vars as --env flags", async () => {
-    const { exec, calls } = fakeExec([{ stdout: agentStartedEnvelope }]);
+  it("agentStart passes env vars as --env flags on pane split", async () => {
+    const { exec, calls } = fakeExec([
+      { stdout: paneSplitEnvelope },
+      { stdout: "" },
+    ]);
     const client = createHerdrClient({ exec });
 
     await client.agentStart({
@@ -91,8 +92,6 @@ describe("HerdrClient", () => {
     assert.equal(args[envIdx + 1], "PI_SUBAGENT_ID=abc");
     assert.equal(args[envIdx + 2], "--env");
     assert.equal(args[envIdx + 3], "FOO=bar");
-    // env flags must come before the -- argv separator
-    assert.ok(envIdx < args.indexOf("--"));
   });
 
   it("error envelope surfaces code+message", async () => {

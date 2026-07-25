@@ -44,6 +44,8 @@ export interface HerdrClient {
     cwd: string;
     tabId?: string;
     split?: "right" | "down";
+    /** When set, split from this pane instead of the orchestrator's current pane. */
+    splitFromPaneId?: string;
     env?: Record<string, string>;
     argv: string[];
   }): Promise<AgentStartResult>;
@@ -158,26 +160,34 @@ export function createHerdrClient(opts?: { exec?: ExecFn; bin?: string }): Herdr
 
   return {
     async agentStart(p) {
-      const args = ["agent", "start", p.name, "--cwd", p.cwd];
-      if (p.tabId) args.push("--tab", p.tabId);
-      if (p.split) args.push("--split", p.split);
+      // herdr ≥ 0.7.5: topology (split/cwd/env) is pane split; argv launch is pane run.
+      const splitArgs = [
+        "pane",
+        "split",
+        ...(p.splitFromPaneId ? [p.splitFromPaneId] : ["--current"]),
+        "--direction",
+        p.split ?? "right",
+        "--cwd",
+        p.cwd,
+        "--no-focus",
+      ];
       for (const [key, value] of Object.entries(p.env ?? {})) {
-        args.push("--env", `${key}=${value}`);
+        splitArgs.push("--env", `${key}=${value}`);
       }
-      args.push("--no-focus", "--", ...p.argv);
 
-      const result = await execHerdrJson<{ agent?: Record<string, unknown> }>(args);
-      const agent = result.agent as
-        | { pane_id?: string; terminal_id?: string; workspace_id?: string; tab_id?: string }
-        | undefined;
-      if (!agent?.pane_id) {
-        throw new HerdrError(`herdr agent start returned no pane id: ${JSON.stringify(result)}`);
+      const splitResult = await execHerdrJson<{ pane?: PaneInfo }>(splitArgs);
+      const pane = splitResult.pane;
+      if (!pane?.pane_id) {
+        throw new HerdrError(`herdr pane split returned no pane id: ${JSON.stringify(splitResult)}`);
       }
+
+      await execHerdr(["pane", "run", pane.pane_id, ...p.argv]);
+
       return {
-        paneId: agent.pane_id,
-        terminalId: agent.terminal_id ?? "",
-        workspaceId: agent.workspace_id ?? "",
-        tabId: agent.tab_id ?? "",
+        paneId: pane.pane_id,
+        terminalId: pane.terminal_id ?? "",
+        workspaceId: pane.workspace_id ?? "",
+        tabId: pane.tab_id ?? "",
       };
     },
 
@@ -201,9 +211,8 @@ export function createHerdrClient(opts?: { exec?: ExecFn; bin?: string }): Herdr
     },
 
     async paneSendKeys(paneId, keys) {
-      // Unlike the other pane commands, `pane send-keys` prints NOTHING on
-      // success (verified live against herdr 0.7.1) — only demand exit 0;
-      // failures still surface via the error envelope + nonzero exit.
+      // Unlike the other pane commands, `pane send-keys` prints nothing on
+      // success — only demand exit 0; failures surface via the error envelope.
       await execHerdr(["pane", "send-keys", paneId, ...keys]);
     },
 

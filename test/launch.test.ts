@@ -183,7 +183,7 @@ describe("launch plan: curated env exports", () => {
     const fx = makeFixture();
     fx.env.SECRET_XYZ = "leak-me-not";
     fx.env.PI_SUBAGENT_ID = "parents-own-id"; // orchestrator is itself a subagent
-    const agentDefs: AgentDefaults = { autoExit: true, denyTools: "subagent" };
+    const agentDefs: AgentDefaults = { interactive: false, denyTools: "subagent" };
     const p = plan(fx, { agent: "worker" }, agentDefs);
     const script = scriptOf(p);
 
@@ -201,10 +201,16 @@ describe("launch plan: curated env exports", () => {
     assert.ok(!script.includes("parents-own-id"), "orchestrator's own PI_SUBAGENT_ID must not leak");
   });
 
-  it("omits PI_SUBAGENT_AUTO_EXIT and PI_SUBAGENT_AGENT without agent defs", () => {
+  it("omits PI_SUBAGENT_AUTO_EXIT for interactive spawns", () => {
+    const fx = makeFixture();
+    const script = scriptOf(plan(fx, { interactive: true }));
+    assert.ok(!script.includes("PI_SUBAGENT_AUTO_EXIT"));
+  });
+
+  it("sets PI_SUBAGENT_AUTO_EXIT for non-interactive spawns by default", () => {
     const fx = makeFixture();
     const script = scriptOf(plan(fx));
-    assert.ok(!script.includes("PI_SUBAGENT_AUTO_EXIT"));
+    assert.ok(script.includes("PI_SUBAGENT_AUTO_EXIT=1"));
     assert.ok(!script.includes("PI_SUBAGENT_AGENT="));
   });
 
@@ -264,8 +270,8 @@ describe("launch plan: pi argv", () => {
     assert.equal(argv[argv.indexOf("--session") + 1], p.sessionFile);
     assert.equal(argv[argv.indexOf("-e") + 1], donePath);
     assert.ok(donePath.startsWith("/"));
-    // standalone → artifact-backed task delivery
-    assert.ok(p.taskArtifactFile, "task artifact expected for standalone mode");
+    // lineage-only → artifact-backed task delivery
+    assert.ok(p.taskArtifactFile, "task artifact expected for lineage-only mode");
     assert.equal(argv[argv.length - 1], `@${p.taskArtifactFile}`);
   });
 
@@ -342,10 +348,10 @@ describe("launch plan: task delivery", () => {
     assert.ok(!p.piArgv.some((a) => a.includes("Complete your task")));
   });
 
-  it("standalone mode writes the task artifact with wrapper instructions", () => {
+  it("lineage-only mode writes the task artifact with wrapper instructions", () => {
     const fx = makeFixture();
-    const p = plan(fx, { task: "Fix the bug" }, { autoExit: true });
-    assert.equal(p.seedSession, null);
+    const p = plan(fx, { task: "Fix the bug" });
+    assert.equal(p.seedSession.mode, "lineage-only");
     const task = p.files.find((f) => f.path === p.taskArtifactFile);
     assert.ok(task);
     assert.ok(task.content.includes("Fix the bug"));
@@ -361,9 +367,9 @@ describe("launch plan: task delivery", () => {
     assert.ok(p.taskArtifactFile);
   });
 
-  it("non-auto-exit agents get the subagent_done wrapper instructions", () => {
+  it("interactive agents get the subagent_done wrapper instructions", () => {
     const fx = makeFixture();
-    const p = plan(fx, {}, { autoExit: false });
+    const p = plan(fx, { interactive: true });
     const task = p.files.find((f) => f.path === p.taskArtifactFile);
     assert.ok(task?.content.includes("call the subagent_done tool"));
   });
@@ -409,7 +415,7 @@ describe("launch plan: structure", () => {
     const fx = makeFixture();
     writeFileSync(join(fx.cwd, ".envrc"), "use devenv\n");
     const p = plan(fx, { cwd: fx.cwd, agent: "worker" }, {
-      autoExit: true,
+      interactive: false,
       tools: "read,bash",
       skills: "commit",
       model: "anthropic/claude-x",

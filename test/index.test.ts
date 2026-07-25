@@ -446,7 +446,7 @@ describe("index: subagent tool", () => {
     assert.equal(message.customType, "subagent_result");
     assert.match(message.content, /completed/);
     assert.match(message.content, /did the thing/);
-    assert.match(message.content, /Context: 75,000\/200,000 tokens/);
+    assert.match(message.content, /Context: 75k\/200k tokens/);
     assert.deepEqual(message.details.contextUsage, {
       version: 1,
       subagentId: result.details.id,

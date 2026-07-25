@@ -198,7 +198,6 @@ function makeRunning(overrides?: Partial<RunningSubagent>): RunningSubagent {
     sessionFile: "/tmp/a1.jsonl",
     launchScriptFile: "/tmp/a1.sh",
     interactive: false,
-    autoExit: true,
     ...overrides,
   };
 }
@@ -339,13 +338,11 @@ describe("index tools: subagent_interrupt", () => {
 // ── subagent_resume ─────────────────────────────────────────────────────────
 
 describe("index tools: subagent_resume", () => {
-  it("resolveResumeLaunchBehavior defaults to auto-exit, non-interactive", () => {
+  it("resolveResumeLaunchBehavior defaults to non-interactive", () => {
     assert.deepEqual(__test__.resolveResumeLaunchBehavior({}), {
-      autoExit: true,
       interactive: false,
     });
-    assert.deepEqual(__test__.resolveResumeLaunchBehavior({ autoExit: false }), {
-      autoExit: false,
+    assert.deepEqual(__test__.resolveResumeLaunchBehavior({ interactive: true }), {
       interactive: true,
     });
   });
@@ -509,7 +506,7 @@ describe("index tools: polished widget", () => {
     const fx = makeFixture();
     writeFileSync(
       join(fx.agentDir, "agents", "scout.md"),
-      "---\nname: scout\nauto-exit: true\n---\nScout the codebase.\n",
+      "---\nname: scout\ninteractive: false\n---\nScout the codebase.\n",
     );
     const widgets: Array<{ id: string; widget: any; options: any }> = [];
     (fx.ctx as any).hasUI = true;

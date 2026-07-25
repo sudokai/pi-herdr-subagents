@@ -9,17 +9,17 @@
 // rely on them; do not rename.
 //
 // Refinements over the reference (plan §10):
-//   (a) exit-0-without-subagent_done gets distinct honest phrasing
-//       ("closed by user, no subagent_done") instead of a generic "completed";
+//   (a) exit-0-without-subagent_done is the default interactive path and is
+//       rendered as a normal completion (session closed by user).
 //   (b) pane-killed / gap-exit still deliver the last assistant message from
 //       the child session file (written incrementally) + the session path so
 //       the orchestrator can resume.
 //
 // Tool descriptions/promptSnippets are NOT here (Task 10) — outcome→message only.
-import { keyHint } from "@mariozechner/pi-coding-agent";
-import { Box, Text } from "@mariozechner/pi-tui";
+import { keyHint } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
 
-import type { ContextUsageSnapshot } from "./context-usage.ts";
+import { formatContextUsageLine, type ContextUsageSnapshot } from "./context-usage.ts";
 import type { RunningSubagent, SubagentOutcome } from "./watcher.ts";
 
 export interface SubagentSteerMessage {
@@ -38,16 +38,6 @@ export function formatElapsed(seconds: number): string {
 
 function sessionRef(sessionFile: string | undefined): string {
   return sessionFile ? `\n\nSession: ${sessionFile}\nResume: pi --session ${sessionFile}` : "";
-}
-
-function contextUsageLine(usage: ContextUsageSnapshot | null | undefined): string {
-  if (usage?.tokens == null || usage.percent == null || usage.contextWindow <= 0) return "";
-
-  const remaining = Math.max(0, usage.contextWindow - usage.tokens);
-  return (
-    `\n\nContext: ${usage.tokens.toLocaleString("en-US")}/${usage.contextWindow.toLocaleString("en-US")} tokens ` +
-    `(${usage.percent}% used, ${remaining.toLocaleString("en-US")} remaining).`
-  );
 }
 
 /** Ported: completed/failed presentation with Session:/Resume: block. */
@@ -72,7 +62,7 @@ export function buildOutcomeMessage(
 ): SubagentSteerMessage | null {
   const now = opts?.now ?? Date.now;
   const elapsed = Math.max(0, Math.floor((now() - running.startTime) / 1000));
-  const usageSuffix = contextUsageLine(opts?.contextUsage);
+  const usageSuffix = formatContextUsageLine(opts?.contextUsage);
 
   const baseDetails: Record<string, unknown> = {
     name: running.name,
@@ -115,7 +105,7 @@ export function buildOutcomeMessage(
       return {
         customType: "subagent_result",
         content:
-          `Sub-agent "${running.name}" exited (session closed by user, no subagent_done) ` +
+          `Sub-agent "${running.name}" completed (session closed by user) ` +
           `after ${formatElapsed(elapsed)} — last message:\n\n` +
           `${outcome.summary}${sessionRef(running.sessionFile)}${usageSuffix}`,
         display: true,
@@ -224,7 +214,7 @@ function statusText(disposition: string | undefined, exitCode: number): string {
     case "completed":
       return "completed";
     case "completed-user-exit":
-      return "closed by user (no subagent_done)";
+      return "closed by user";
     case "launch-failed":
       return `failed to launch (exit ${exitCode})`;
     case "pane-killed":
@@ -275,7 +265,7 @@ export function renderSubagentResult(
               .replace(/^Sub-agent "[^"]*" [^\n]*\n\n/, "");
 
       const contentLines = [header];
-      const usageLine = contextUsageLine(details.contextUsage).trim();
+      const usageLine = formatContextUsageLine(details.contextUsage).trim();
       if (usageLine) contentLines.push(theme.fg("dim", usageLine));
 
       if (options.expanded) {
@@ -329,7 +319,7 @@ export function renderSubagentPing(
       const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "— needs help")}`;
 
       const contentLines = [header];
-      const usageLine = contextUsageLine(details.contextUsage).trim();
+      const usageLine = formatContextUsageLine(details.contextUsage).trim();
       if (usageLine) contentLines.push(theme.fg("dim", usageLine));
 
       if (options.expanded) {

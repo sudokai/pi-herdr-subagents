@@ -21,7 +21,6 @@ function makeRunning(overrides?: Partial<RunningSubagent>): RunningSubagent {
     sessionFile: "/tmp/sessions/child.jsonl",
     launchScriptFile: "/tmp/artifacts/subagent-scripts/worker-sub1.sh",
     interactive: false,
-    autoExit: true,
     ...overrides,
   };
 }
@@ -70,7 +69,7 @@ describe("buildOutcomeMessage", () => {
     assert.ok(msg);
     assert.match(
       msg.content,
-      /Context: 75,000\/200,000 tokens \(37\.5% used, 125,000 remaining\)\./,
+      /Context: 75k\/200k tokens \(37\.50% used, 125k remaining\)\./,
     );
     assert.deepEqual(msg.details.contextUsage, contextUsage);
 
@@ -80,7 +79,7 @@ describe("buildOutcomeMessage", () => {
       createTheme() as any,
     );
     assert.ok(rendered);
-    assert.match(rendered.render(80).join("\n"), /125,000 remaining/);
+    assert.match(rendered.render(80).join("\n"), /125k remaining/);
   });
 
   it("keeps unknown/null usage structured but omits a misleading visible line", () => {
@@ -108,7 +107,6 @@ describe("buildOutcomeMessage", () => {
     assert.ok(msg);
     assert.equal(msg.customType, "subagent_result");
     assert.match(msg.content, /closed by user/);
-    assert.match(msg.content, /no subagent_done/);
     assert.match(msg.content, /Last thing I said\./);
     assert.match(msg.content, /Session: \/tmp\/sessions\/child\.jsonl/);
     assert.match(msg.content, /Resume: pi --session/);

@@ -18,9 +18,9 @@
  * pi-extension/subagents/index.ts @ fix/launch-verify-retry, adapted for herdr
  * (argv launch via src/launch.ts + herdr client, no mux/screen-scrape code).
  */
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
+import { Type, type TSchema } from "typebox";
 import { constants as fsConstants, copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,6 +39,13 @@ import {
   resolveResumeLaunchBehavior,
 } from "./src/launch.ts";
 import {
+  __paneLayoutTest__,
+  maybeResetSubagentPaneLayout,
+  resolveSubagentPaneSplit,
+  startSubagentPaneWithLayout,
+} from "./src/pane-layout.ts";
+import { collectEqualSplitTargets } from "./src/herdr/layout-equalize.ts";
+import {
   buildOutcomeMessage,
   renderSubagentPing,
   renderSubagentResult,
@@ -51,9 +58,44 @@ import {
   type SubagentOutcome,
   type WatcherDeps,
 } from "./src/watcher.ts";
-
 /** Absolute path of this module — used to detect losing the tool-registry race. */
 const MODULE_PATH = fileURLToPath(import.meta.url);
+
+export interface BaseSpawnParams {
+  name: string;
+  task: string;
+  agent?: string;
+  model?: string;
+  thinking?: string;
+  skills?: string;
+  tools?: string;
+  cwd?: string;
+  fork?: boolean;
+  interactive?: boolean;
+}
+
+export interface ExpandLaunchParamsContext {
+  cwd: string;
+  model?: { provider: string; id: string };
+  modelRegistry?: {
+    find(provider: string, modelId: string): { provider: string; id: string } | undefined | null;
+  };
+  parentThinking: string;
+}
+
+export interface HerdrSubagentsOptions {
+  /** Additional module paths treated as this provider (for re-export wrappers). */
+  providerEntryPaths?: string[];
+  /** Appended to base subagent tool description. */
+  spawnDescriptionSuffix?: string;
+  /** Extra TypeBox fields merged into SubagentParams (e.g. amplike `mode`). */
+  extraSpawnParams?: Record<string, TSchema>;
+  /** Called before buildLaunchPlan when model/thinking/mode need expansion. */
+  expandLaunchParams?: (
+    params: BaseSpawnParams & Record<string, unknown>,
+    ctx: ExpandLaunchParamsContext,
+  ) => Promise<BaseSpawnParams & Record<string, unknown>>;
+}
 
 // ── /reload safety ──────────────────────────────────────────────────────────
 // /reload re-imports this file, giving fresh module-level state, but closures
@@ -273,6 +315,23 @@ function startWidgetRefresh(): void {
 
 // ── watcher arming + outcome→steer wiring ───────────────────────────────────
 
+/** Close the herdr pane after intentional child shutdown (subagent_done or caller_ping). */
+export function shouldAutoCloseSubagentPane(outcome: SubagentOutcome, _interactive: boolean): boolean {
+  return outcome.kind === "completed" || outcome.kind === "ping";
+}
+
+async function closeSubagentPaneIfNeeded(
+  running: RunningSubagent,
+  outcome: SubagentOutcome,
+): Promise<void> {
+  if (!shouldAutoCloseSubagentPane(outcome, running.interactive)) return;
+  try {
+    await deps.client.paneClose(running.paneId);
+  } catch {
+    // Pane may already be gone — best-effort cleanup.
+  }
+}
+
 function armWatcher(
   pi: ExtensionAPI,
   running: RunningSubagent,
@@ -295,10 +354,12 @@ function armWatcher(
       stream: getEventStream(),
       signal: watcherAbort.signal,
     })
-    .then((outcome) => {
+    .then(async (outcome) => {
       runningSubagents.delete(running.id);
+      maybeResetSubagentPaneLayout(runningSubagents.size);
       markSubagentInactive(running.id);
       updateWidget();
+      await closeSubagentPaneIfNeeded(running, outcome);
       const contextUsage =
         outcome.kind === "cancelled"
           ? null
@@ -312,6 +373,7 @@ function armWatcher(
     })
     .catch((err: any) => {
       runningSubagents.delete(running.id);
+      maybeResetSubagentPaneLayout(runningSubagents.size);
       markSubagentInactive(running.id);
       updateWidget();
       pi.sendMessage(
@@ -331,46 +393,72 @@ function armWatcher(
 
 // ── tool parameter schema (ported, minus Claude-only resumeSessionId) ───────
 
-const SubagentParams = Type.Object({
-  name: Type.String({ description: "Display name for the subagent" }),
-  task: Type.String({ description: "Task/prompt for the sub-agent" }),
-  agent: Type.Optional(
-    Type.String({
-      description:
-        "Agent name to load defaults from (e.g. 'worker', 'scout', 'reviewer'). Reads ~/.pi/agent/agents/<name>.md for model, tools, skills.",
-    }),
-  ),
-  systemPrompt: Type.Optional(
-    Type.String({ description: "Appended to system prompt (role instructions)" }),
-  ),
-  model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
-  skills: Type.Optional(
-    Type.String({ description: "Comma-separated skills (overrides agent default)" }),
-  ),
-  tools: Type.Optional(
-    Type.String({ description: "Comma-separated tools (overrides agent default)" }),
-  ),
-  cwd: Type.Optional(
-    Type.String({
-      description:
-        "Working directory for the sub-agent. The agent starts in this folder and picks up its local .pi/ config, CLAUDE.md, skills, and extensions. Use for role-specific subfolders.",
-    }),
-  ),
-  fork: Type.Optional(
-    Type.Boolean({
-      description:
-        "Force the full-context fork mode for this spawn. The sub-agent inherits the current session conversation, overriding any agent frontmatter session-mode.",
-    }),
-  ),
-  interactive: Type.Optional(
-    Type.Boolean({
-      description:
-        "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`.",
-    }),
-  ),
-});
+const ThinkingEnum = Type.Union(
+  [
+    Type.Literal("off"),
+    Type.Literal("minimal"),
+    Type.Literal("low"),
+    Type.Literal("medium"),
+    Type.Literal("high"),
+    Type.Literal("xhigh"),
+    Type.Literal("max"),
+  ],
+  {
+    description:
+      "Pi thinking level. Omit inherits parent. Primary per-child control: minimal/low for bounded work; medium for review; high+ for architecture or hard diagnosis.",
+  },
+);
 
-const SUBAGENT_DESCRIPTION =
+const MODEL_FIELD_DESCRIPTION =
+  "Exact registered provider/model-id (split at first '/'). Omit inherits parent. No aliases, profiles, or fuzzy patterns.";
+
+function buildSubagentParams(extraSpawnParams: Record<string, TSchema> = {}) {
+  return Type.Object({
+    name: Type.String({ description: "Display name for the subagent" }),
+    task: Type.String({ description: "Task/prompt for the sub-agent" }),
+    agent: Type.Optional(
+      Type.String({
+        description:
+          "Agent name to load defaults from (e.g. 'worker', 'scout', 'reviewer'). Reads ~/.pi/agent/agents/<name>.md for model, tools, skills.",
+      }),
+    ),
+    systemPrompt: Type.Optional(
+      Type.String({ description: "Appended to system prompt (role instructions)" }),
+    ),
+    model: Type.Optional(Type.String({ description: `Model override. ${MODEL_FIELD_DESCRIPTION}` })),
+    thinking: Type.Optional(ThinkingEnum),
+    skills: Type.Optional(
+      Type.String({ description: "Comma-separated skills (overrides agent default)" }),
+    ),
+    tools: Type.Optional(
+      Type.String({ description: "Comma-separated tools (overrides agent default)" }),
+    ),
+    cwd: Type.Optional(
+      Type.String({
+        description:
+          "Working directory for the sub-agent. The agent starts in this folder and picks up its local .pi/ config, CLAUDE.md, skills, and extensions. Use for role-specific subfolders.",
+      }),
+    ),
+    fork: Type.Optional(
+      Type.Boolean({
+        description:
+          "Force the full-context fork mode for this spawn. The sub-agent inherits the current session conversation, overriding any agent frontmatter session-mode.",
+      }),
+    ),
+    interactive: Type.Optional(
+      Type.Boolean({
+        description:
+          "If true, the subagent runs interactively: its pane stays open for user interaction until the user exits or asks the subagent to finish (e.g., via /done). " +
+          "The parent will receive the final summary when the session ends. " +
+          "If false (default), the subagent is an autonomous worker: it auto-exits when done and its pane closes. " +
+          "If omitted, falls back to the agent's `interactive` frontmatter.",
+      }),
+    ),
+    ...extraSpawnParams,
+  });
+}
+
+const SUBAGENT_DESCRIPTION_BASE =
   "Spawn a sub-agent in a dedicated herdr pane. " +
   "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
   "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
@@ -384,7 +472,7 @@ const SETUP_HINT =
   "Subagents require pi to run inside a herdr pane (https://github.com/ogulcancelik/herdr). " +
   "Start herdr in your terminal, open a pane, and run pi there — herdr injects HERDR_ENV, " +
   "HERDR_PANE_ID, and HERDR_SOCKET_PATH into every pane, which this extension needs to " +
-  "launch and observe subagents. Install herdr ≥ 0.7.1 and restart pi inside it.";
+  "launch and observe subagents. Install herdr ≥ 0.7.5 and restart pi inside it.";
 
 const SPAWN_TOOL_NAMES = ["subagent", "subagent_resume", "subagent_interrupt", "subagents_list"];
 
@@ -417,15 +505,20 @@ function errorResult(text: string, error: string) {
 
 async function executeSubagentSpawn(
   pi: ExtensionAPI,
-  params: typeof SubagentParams.static,
+  params: BaseSpawnParams & Record<string, unknown>,
   ctx: {
     cwd: string;
+    model?: { provider: string; id: string };
+    modelRegistry?: {
+      find(provider: string, modelId: string): { provider: string; id: string } | undefined | null;
+    };
     sessionManager: {
       getSessionFile(): string | null;
       getSessionId(): string;
       getSessionDir(): string;
     };
   },
+  opts: Pick<HerdrSubagentsOptions, "expandLaunchParams"> & { expansionParamKeys?: string[] },
 ) {
   // Prevent self-spawning (e.g. planner spawning another planner)
   const currentAgent = process.env.PI_SUBAGENT_AGENT;
@@ -455,9 +548,39 @@ async function executeSubagentSpawn(
     );
   }
 
+  let launchParams: BaseSpawnParams & Record<string, unknown> = params;
+  const expansionKeys = opts.expansionParamKeys ?? ["model", "thinking"];
+  const needsExpansion =
+    opts.expandLaunchParams && expansionKeys.some((key) => params[key] != null);
+  if (needsExpansion) {
+    if (!ctx.model) {
+      return errorResult(
+        "Error: subagent mode/model/thinking expansion requires a resolved parent model.",
+        "no parent model",
+      );
+    }
+    if (!ctx.modelRegistry) {
+      return errorResult(
+        "Error: subagent mode/model/thinking expansion requires the model registry.",
+        "no model registry",
+      );
+    }
+    try {
+      launchParams = await opts.expandLaunchParams!(params, {
+        cwd: ctx.cwd,
+        modelRegistry: ctx.modelRegistry,
+        model: ctx.model,
+        parentThinking: pi.getThinkingLevel(),
+      });
+    } catch (error: any) {
+      const message = error?.message ?? String(error);
+      return errorResult(`Failed to expand subagent launch params: ${message}`, message);
+    }
+  }
+
   let plan;
   try {
-    plan = buildLaunchPlan(params, agentDefs, {
+    plan = buildLaunchPlan(launchParams, agentDefs, {
       sessionDir: ctx.sessionManager.getSessionDir(),
       sessionId: ctx.sessionManager.getSessionId(),
       parentSessionFile,
@@ -471,13 +594,15 @@ async function executeSubagentSpawn(
 
   // Execute the plan: write artifacts, seed the child session, start the pane.
   writePlanFiles(plan.files);
-  if (plan.seedSession) {
-    seedSubagentSessionFile(plan.seedSession);
-  }
+  seedSubagentSessionFile(plan.seedSession);
 
   let started;
   try {
-    started = await deps.client.agentStart(plan.agentStart);
+    started = await startSubagentPaneWithLayout(
+      plan.agentStart,
+      runningSubagents.values(),
+      (payload) => deps.client.agentStart(payload),
+    );
   } catch (error: any) {
     const message = error?.message ?? String(error);
     return errorResult(`Failed to start herdr pane for "${params.name}": ${message}`, message);
@@ -493,7 +618,6 @@ async function executeSubagentSpawn(
     sessionFile: plan.sessionFile,
     launchScriptFile: plan.launchScriptFile,
     interactive: plan.interactive,
-    autoExit: plan.autoExit,
   };
   armWatcher(pi, running);
 
@@ -528,16 +652,21 @@ function writePlanFiles(files: Array<{ path: string; content: string }>): void {
   }
 }
 
-function registerSubagentTool(pi: ExtensionAPI): void {
+function registerSubagentTool(
+  pi: ExtensionAPI,
+  subagentDescription: string,
+  subagentParams: ReturnType<typeof buildSubagentParams>,
+  spawnOpts: Pick<HerdrSubagentsOptions, "expandLaunchParams"> & { expansionParamKeys?: string[] },
+): void {
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
-    description: SUBAGENT_DESCRIPTION,
-    promptSnippet: SUBAGENT_DESCRIPTION,
-    parameters: SubagentParams,
+    description: subagentDescription,
+    promptSnippet: subagentDescription,
+    parameters: subagentParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      return executeSubagentSpawn(pi, params, ctx as any);
+      return executeSubagentSpawn(pi, params, ctx as any, spawnOpts);
     },
 
     renderCall(args, theme) {
@@ -640,7 +769,7 @@ const RESUME_DESCRIPTION =
 
 async function executeSubagentResume(
   pi: ExtensionAPI,
-  params: { sessionPath: string; name?: string; message?: string; autoExit?: boolean },
+  params: { sessionPath: string; name?: string; message?: string; interactive?: boolean },
   ctx: {
     cwd: string;
     sessionManager: {
@@ -684,7 +813,11 @@ async function executeSubagentResume(
 
   let started;
   try {
-    started = await deps.client.agentStart(plan.agentStart);
+    started = await startSubagentPaneWithLayout(
+      plan.agentStart,
+      runningSubagents.values(),
+      (payload) => deps.client.agentStart(payload),
+    );
   } catch (error: any) {
     const message = error?.message ?? String(error);
     return errorResult(`Failed to start herdr pane for "${plan.name}": ${message}`, message);
@@ -699,7 +832,6 @@ async function executeSubagentResume(
     sessionFile: params.sessionPath,
     launchScriptFile: plan.launchScriptFile,
     interactive: plan.interactive,
-    autoExit: plan.autoExit,
   };
   armWatcher(pi, running, (outcome) =>
     resolveResumeOutcome(outcome, params.sessionPath, entryCountBefore),
@@ -734,10 +866,12 @@ function registerResumeTool(pi: ExtensionAPI): void {
           description: "Optional message to send after resuming (e.g. follow-up instructions)",
         }),
       ),
-      autoExit: Type.Optional(
+      interactive: Type.Optional(
         Type.Boolean({
           description:
-            "Whether the resumed session should automatically exit after completing its response. Defaults to true for autonomous follow-up work; set false for interactive resumed sessions.",
+            "If true, the resumed session is interactive: its pane stays open for user interaction until the user exits or asks the subagent to finish (e.g., via /done). " +
+            "The parent will receive the final summary when the session ends. " +
+            "If false (default), the resumed session is autonomous: it auto-exits when done and its pane closes.",
         }),
       ),
     }),
@@ -1056,7 +1190,24 @@ function registerCommands(pi: ExtensionAPI): void {
 
 // ── extension entry ─────────────────────────────────────────────────────────
 
-export default function herdrSubagents(pi: ExtensionAPI) {
+export function createHerdrSubagentsExtension(
+  opts: HerdrSubagentsOptions = {},
+): (pi: ExtensionAPI) => void {
+  const providerEntryPaths = opts.providerEntryPaths ?? [];
+  const spawnDescriptionSuffix = opts.spawnDescriptionSuffix ?? "";
+  const extraSpawnParams = opts.extraSpawnParams ?? {};
+  const subagentDescription = SUBAGENT_DESCRIPTION_BASE + spawnDescriptionSuffix;
+  const subagentParams = buildSubagentParams(extraSpawnParams);
+  const spawnOpts = {
+    expandLaunchParams: opts.expandLaunchParams,
+    expansionParamKeys: ["model", "thinking", ...Object.keys(extraSpawnParams)],
+  };
+
+  function isOwnSubagentProvider(path: string | undefined): boolean {
+    return path === MODULE_PATH || providerEntryPaths.includes(path ?? "");
+  }
+
+  return function herdrSubagents(pi: ExtensionAPI) {
   const inHerdr = isInsideHerdr();
 
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
@@ -1070,7 +1221,7 @@ export default function herdrSubagents(pi: ExtensionAPI) {
 
   let registeredRealTools = false;
   if (inHerdr) {
-    if (shouldRegister("subagent")) registerSubagentTool(pi);
+    if (shouldRegister("subagent")) registerSubagentTool(pi, subagentDescription, subagentParams, spawnOpts);
     if (shouldRegister("subagent_resume")) registerResumeTool(pi);
     if (shouldRegister("subagent_interrupt")) registerInterruptTool(pi);
     if (shouldRegister("subagents_list")) registerListTool(pi);
@@ -1093,7 +1244,7 @@ export default function herdrSubagents(pi: ExtensionAPI) {
     // warn visibly — never fail silently (PLAN.md Key Decision #3).
     if (registeredRealTools && shouldRegister("subagent")) {
       const winner = pi.getAllTools().find((tool) => tool.name === "subagent");
-      if (winner?.sourceInfo?.path && winner.sourceInfo.path !== MODULE_PATH) {
+      if (winner?.sourceInfo?.path && !isOwnSubagentProvider(winner.sourceInfo.path)) {
         ctx.ui.notify(
           `pi-herdr-subagents: another extension's "subagent" tool won the registry race ` +
             `(${winner.sourceInfo.path}). List pi-herdr-subagents BEFORE pi-interactive-subagents ` +
@@ -1145,7 +1296,10 @@ export default function herdrSubagents(pi: ExtensionAPI) {
   pi.registerMessageRenderer("subagent_ping", (message, options, theme) =>
     renderSubagentPing(message as any, options, theme as any),
   );
+  };
 }
+
+export default createHerdrSubagentsExtension();
 
 // ── test seam ───────────────────────────────────────────────────────────────
 
@@ -1153,9 +1307,14 @@ export const __test__ = {
   isInsideHerdr,
   runningSubagents,
   renderSubagentWidgetLines,
+  shouldAutoCloseSubagentPane,
   resolveInterruptTarget,
   resolveResumeLaunchBehavior,
   resolveResumeOutcome,
+  resolveSubagentPaneSplit,
+  startSubagentPaneWithLayout,
+  collectEqualSplitTargets,
+  __paneLayoutTest__,
   setDeps(overrides: Partial<RuntimeDeps>): void {
     deps = { ...deps, ...overrides };
   },

@@ -1,7 +1,8 @@
 /**
  * Extension loaded into every subagent child pi (via `-e <this file>`).
- * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
- * - Provides a `subagent_done` tool for autonomous agents to self-terminate
+ * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+Shift+J)
+ * - Provides a `subagent_done` tool to exit the subagent session and return results to the parent
+ * - Provides a `/done` command for interactive sessions to trigger a final summary and exit
  * - Provides a `caller_ping` tool to ask the parent orchestrator for help
  *
  * Ported from pi-interactive-subagents (MIT, HazAT)
@@ -14,12 +15,15 @@
  * these shapes — {"type":"done"} and {"type":"ping","name":...,"message":...}.
  * Keep this file dependency-light: it loads into EVERY child.
  */
-import type { ContextUsage, ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Box, Text } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+import type { ContextUsage, ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import { writeFileSync } from "node:fs";
 
-import { writeContextUsageSidecar } from "./src/context-usage.ts";
+import {
+  aggregateSessionTokenBreakdown,
+  writeContextUsageSidecar,
+} from "./src/context-usage.ts";
 import { getActiveSubagentCount } from "./src/runtime-state.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -42,9 +46,9 @@ export function shouldAutoExitOnAgentEnd(
   if (messages) {
     // A turn that ends at a user message produced no assistant reply — the
     // request errored / is retrying. This happens on resumed sessions whose
-    // first request times out (verified live, pi 0.80.3): agent_end fires
-    // while pi is "Retrying (1/3)"; walking backwards would find the
-    // PREVIOUS conversation's assistant and shut pi down mid-retry.
+    // first request times out: agent_end fires while pi is retrying; walking
+    // backwards would find the previous conversation's assistant and shut pi
+    // down mid-retry.
     const last = messages[messages.length - 1];
     if (last?.role === "user") return false;
 
@@ -109,7 +113,7 @@ export default function (pi: ExtensionAPI) {
         if (expanded) {
           // Expanded: full tool list + denied
           const countInfo = theme.fg("dim", ` — ${toolNames.length} available`);
-          const hint = theme.fg("muted", "  (Ctrl+J to collapse)");
+          const hint = theme.fg("muted", "  (Ctrl+Shift+J to collapse)");
 
           const toolList = toolNames
             .map((name: string) => theme.fg("dim", name))
@@ -136,7 +140,7 @@ export default function (pi: ExtensionAPI) {
             denied.length > 0
               ? theme.fg("dim", " · ") + theme.fg("error", `${denied.length} denied`)
               : "";
-          const hint = theme.fg("muted", "  (Ctrl+J to expand)");
+          const hint = theme.fg("muted", "  (Ctrl+Shift+J to expand)");
 
           const content = new Text(`${agentTag}${countInfo}${deniedInfo}${hint}`, 0, 0);
           box.addChild(content);
@@ -153,7 +157,10 @@ export default function (pi: ExtensionAPI) {
   let contextUsageWritten = false;
 
   function snapshotContextUsage(
-    ctx: { getContextUsage?: () => ContextUsage | null | undefined },
+    ctx: {
+      getContextUsage?: () => ContextUsage | null | undefined;
+      sessionManager?: { getEntries: () => Parameters<typeof aggregateSessionTokenBreakdown>[0] };
+    },
     fallback = false,
   ): void {
     if (contextUsageWritten) return;
@@ -170,10 +177,28 @@ export default function (pi: ExtensionAPI) {
     }
     if (usage == null) return;
 
+    const breakdown = ctx.sessionManager
+      ? aggregateSessionTokenBreakdown(ctx.sessionManager.getEntries())
+      : undefined;
+
     try {
-      contextUsageWritten = writeContextUsageSidecar(sessionFile, id, usage, {
-        overwrite: !fallback,
-      });
+      contextUsageWritten = writeContextUsageSidecar(
+        sessionFile,
+        id,
+        {
+          ...usage,
+          ...(breakdown
+            ? {
+                input: breakdown.input,
+                cacheRead: breakdown.cacheRead,
+                output: breakdown.output,
+              }
+            : {}),
+        },
+        {
+          overwrite: !fallback,
+        },
+      );
     } catch {
       // Telemetry is best-effort and must never prevent terminal signaling.
     }
@@ -232,14 +257,27 @@ export default function (pi: ExtensionAPI) {
     snapshotContextUsage(ctx, true);
   });
 
-  // Toggle expand/collapse with Ctrl+J
-  pi.registerShortcut("ctrl+j", {
+  // Toggle expand/collapse with Ctrl+Shift+J (avoid ctrl+j — built-in newLine)
+  pi.registerShortcut("ctrl+shift+j", {
     description: "Toggle subagent tools widget",
     handler: (ctx) => {
       expanded = !expanded;
       renderWidget(ctx);
     },
   });
+
+  // /done — ask the subagent to summarize and return results to the parent.
+  // Only meaningful in interactive subagents; non-interactive subagents auto-exit.
+  if (!autoExit) {
+    pi.registerCommand("done", {
+      description: "Ask the subagent to summarize and return results to the parent",
+      handler: async (_args, _ctx) => {
+        pi.sendUserMessage(
+          "Please provide a final summary of what you accomplished and then call the subagent_done tool to return results to the parent and exit this session.",
+        );
+      },
+    });
+  }
 
   pi.registerTool({
     name: "caller_ping",
@@ -281,9 +319,10 @@ export default function (pi: ExtensionAPI) {
     name: "subagent_done",
     label: "Subagent Done",
     description:
-      "Call this tool when you have completed your task. " +
-      "It will close this session and return your results to the main session. " +
-      "Your LAST assistant message before calling this becomes the summary returned to the caller.",
+      "Call this tool to exit the subagent session and return your results to the parent. " +
+      "In interactive sessions, only call this when the user explicitly asks you to finish (e.g., via /done). " +
+      "Your LAST assistant message before calling this tool becomes the summary returned to the caller. " +
+      "Do not finish with a plain text message; invoke this tool as your final action when exiting.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;

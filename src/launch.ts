@@ -7,7 +7,7 @@
 //
 // Design (PLAN.md Key Decisions #4–#7):
 // - The generated wrapper script is the single place env/wrapping/exit-capture
-//   happens. herdr launches it as a direct argv process (`bash <script>`) — no
+//   happens. herdr launches it via pane split + pane run (`bash <script>`) — no
 //   shell typing, no launch race, no verify/retry machinery.
 // - Env correctness for direnv/devenv repos: the script exports the
 //   orchestrator's PATH + curated PI_SUBAGENT_* vars (never a full env dump),
@@ -45,6 +45,7 @@ export interface SubagentLaunchParams {
   agent?: string;
   cwd?: string;
   model?: string;
+  thinking?: string;
   tools?: string;
   skills?: string;
   systemPrompt?: string;
@@ -86,13 +87,13 @@ export interface LaunchPlan {
   syspromptFile: string | null;
   /** Files the executor must write (mkdir -p dirname first). Includes the launch script. */
   files: Array<{ path: string; content: string }>;
-  /** Session seeding the executor must perform before launch (fork/lineage modes). */
+  /** Session seeding the executor must perform before launch. */
   seedSession: {
     mode: "lineage-only" | "fork";
     parentSessionFile: string;
     childSessionFile: string;
     childCwd: string;
-  } | null;
+  };
   /** Arguments for HerdrClient.agentStart(). */
   agentStart: {
     name: string;
@@ -104,7 +105,6 @@ export interface LaunchPlan {
   /** The unescaped pi invocation embedded in the wrapper script (piArgv[0] = binary). */
   piArgv: string[];
   interactive: boolean;
-  autoExit: boolean;
   /** Startup crash hold-open window in seconds (0 = disabled). */
   holdOpenSecs: number;
 }
@@ -148,7 +148,7 @@ export function buildSubagentToolAllowlist(effectiveTools?: string): string | nu
 /**
  * Build the positional prompt args for a Pi CLI subagent launch.
  *
- * In artifact-backed launches (lineage-only, standalone), Pi's buildInitialMessage()
+ * In artifact-backed launches (lineage-only), Pi's buildInitialMessage()
  * concatenates @file content with messages[0] into one initial prompt. That breaks
  * /skill: expansion because the message no longer starts with "/skill:". Only
  * messages[1..] are sent as separate follow-up prompts where /skill: is recognized.
@@ -306,9 +306,8 @@ export function buildLaunchPlan(
   const effectiveModel = params.model ?? agentDefs?.model;
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
-  const effectiveThinking = agentDefs?.thinking;
+  const effectiveThinking = params.thinking ?? agentDefs?.thinking;
   const interactive = resolveEffectiveInteractive(params, agentDefs);
-  const autoExit = agentDefs?.autoExit ?? false;
 
   const artifactDir = getArtifactDir(ctx.sessionDir, ctx.sessionId);
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(
@@ -330,22 +329,23 @@ export function buildLaunchPlan(
   const sessionFile = join(childSessionDir, `${sessionTimestamp}_${uuid}.jsonl`);
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
-  const seedSession = launchBehavior.seededSessionMode
-    ? {
-        mode: launchBehavior.seededSessionMode,
-        parentSessionFile: ctx.parentSessionFile,
-        childSessionFile: sessionFile,
-        childCwd: targetCwd,
-      }
-    : null;
+  const seedSession = {
+    mode: launchBehavior.sessionMode,
+    parentSessionFile: ctx.parentSessionFile,
+    childSessionFile: sessionFile,
+    childCwd: targetCwd,
+  };
 
-  // ── Task message (wrapper instructions only for blank-session modes) ──
-  const modeHint = autoExit
-    ? "Complete your task autonomously."
-    : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
-  const summaryInstruction = autoExit
-    ? "Your FINAL assistant message should summarize what you accomplished."
-    : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
+  // ── Task message (wrapper instructions for artifact-backed lineage-only launches) ──
+  const modeHint = interactive
+    ? "Complete the task. When you are finished, provide a clear summary of what you accomplished. " +
+      "The session will remain open so the user can review your work and ask follow-up questions. " +
+      "Do not call the subagent_done tool unless the user explicitly asks you to finish."
+    : "Complete your task autonomously.";
+  const summaryInstruction = interactive
+    ? "Your final assistant message after completing the task should summarize what you accomplished. " +
+      "If the user asks you to finish (e.g., via /done), provide a final summary and then call the subagent_done tool to return results to the parent and exit the session."
+    : "Your FINAL assistant message should summarize what you accomplished.";
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = Boolean(systemPromptMode && identity);
@@ -386,9 +386,8 @@ export function buildLaunchPlan(
     piArgv.push("--tools", toolAllowlist);
   }
 
-  // Task delivery: fork inherits the conversation → direct arg; blank-session
-  // modes get the artifact-backed handoff so wrapper instructions arrive as
-  // the initial user message.
+  // Task delivery: fork inherits the conversation → direct arg; lineage-only
+  // launches use an artifact so wrapper instructions arrive as the initial user message.
   let taskArtifactFile: string | null = null;
   let taskArg: string;
   if (launchBehavior.taskDelivery === "direct") {
@@ -419,7 +418,7 @@ export function buildLaunchPlan(
   if (params.agent) {
     exports.push(`export PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
   }
-  if (autoExit) {
+  if (!interactive) {
     exports.push("export PI_SUBAGENT_AUTO_EXIT=1");
   }
   exports.push(`export PI_SUBAGENT_SESSION=${shellEscape(sessionFile)}`);
@@ -465,7 +464,6 @@ export function buildLaunchPlan(
     },
     piArgv,
     interactive,
-    autoExit,
     holdOpenSecs,
   };
 }
@@ -476,20 +474,17 @@ export interface ResumeLaunchParams {
   sessionPath: string;
   name?: string;
   message?: string;
-  autoExit?: boolean;
+  interactive?: boolean;
 }
 
 /**
- * Ported from pi-interactive-subagents: resumed sessions default to
- * autonomous follow-up work (auto-exit, non-interactive); explicit
- * autoExit: false yields an interactive resumed session.
+ * Resumed sessions default to non-interactive (autonomous follow-up work).
+ * Set `interactive: true` to resume into an interactive session that keeps its pane open.
  */
-export function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): {
-  autoExit: boolean;
+export function resolveResumeLaunchBehavior(params: { interactive?: boolean }): {
   interactive: boolean;
 } {
-  const autoExit = params.autoExit ?? true;
-  return { autoExit, interactive: !autoExit };
+  return { interactive: params.interactive ?? false };
 }
 
 export interface ResumeLaunchPlan {
@@ -510,7 +505,6 @@ export interface ResumeLaunchPlan {
   };
   piArgv: string[];
   interactive: boolean;
-  autoExit: boolean;
   holdOpenSecs: number;
 }
 
@@ -532,7 +526,7 @@ export function buildResumeLaunchPlan(
   const now = ctx.now ?? new Date();
   const id = ctx.id ?? Math.random().toString(16).slice(2, 10);
   const displayName = params.name ?? "Resume";
-  const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
+  const { interactive } = resolveResumeLaunchBehavior(params);
 
   const artifactDir = getArtifactDir(ctx.sessionDir, ctx.sessionId);
   const artifactTimestamp = now.toISOString().replace(/[:.]/g, "-").slice(0, 19);
@@ -558,7 +552,7 @@ export function buildResumeLaunchPlan(
     exports.push(`export PI_CODING_AGENT_DIR=${shellEscape(env.PI_CODING_AGENT_DIR)}`);
   }
   exports.push(`export PI_SUBAGENT_NAME=${shellEscape(displayName)}`);
-  if (autoExit) {
+  if (!interactive) {
     exports.push("export PI_SUBAGENT_AUTO_EXIT=1");
   }
   exports.push(`export PI_SUBAGENT_SESSION=${shellEscape(params.sessionPath)}`);
@@ -598,7 +592,6 @@ export function buildResumeLaunchPlan(
     },
     piArgv,
     interactive,
-    autoExit,
     holdOpenSecs,
   };
 }

@@ -83,7 +83,6 @@ function makeRunning(overrides?: Partial<RunningSubagent>): RunningSubagent {
     sessionFile: join(dir, "child.jsonl"),
     launchScriptFile: join(dir, "worker-sub1.sh"),
     interactive: false,
-    autoExit: true,
     ...overrides,
   };
 }
