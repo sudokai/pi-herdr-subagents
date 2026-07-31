@@ -21,6 +21,7 @@ Breaking changes vs upstream `modem-dev/pi-herdr-subagents` @ `c833a55`:
 
 ### Changed
 
+- Subagent tool guidance now mandates ending the parent's turn after spawning/resuming (only spawning more subagents remains allowed before ending it) and notes that results arrive one ping per subagent — the task is complete only once all spawned subagents have reported.
 - Auto-close herdr pane on `subagent_done` / `caller_ping` completion.
 - `completed-user-exit` renders as normal completion (session closed by user).
 - Child sessions always seeded (no null `seedSession`).

@@ -2,8 +2,9 @@
 
 Interactive subagent orchestration for [pi](https://github.com/earendil-works/pi), built natively
 on [herdr](https://github.com/ogulcancelik/herdr) — spawn, resume, and interrupt subagents in
-herdr panes with truthful lifecycle events. **Fully non-blocking**: the orchestrator keeps
-working while subagents run; results are steered back as async messages that wake it up.
+herdr panes with truthful lifecycle events. **Fully non-blocking**: spawning returns an
+immediate ack, the parent ends its turn, and results are steered back as async messages that
+wake it up.
 
 ## Demo
 
@@ -15,7 +16,7 @@ This extension is a herdr-native descendant of
 [pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents) by
 [HazAT](https://github.com/HazAT). I used that extension daily for months and it completely
 changed how I structure my agent work. The orchestration model here is its design — spawn
-subagents into visible terminal surfaces, keep working, get woken by steer messages when they
+subagents into visible terminal surfaces, get woken by steer messages when they
 finish, resume/interrupt/list, markdown agent definitions — and several modules are direct
 ports (see [License](#license)). I've also contributed improvements upstream. If you work in
 tmux, cmux, zellij, or wezterm — or need Claude Code children — use pi-interactive-subagents;

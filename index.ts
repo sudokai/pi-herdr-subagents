@@ -464,7 +464,11 @@ const SUBAGENT_DESCRIPTION_BASE =
   "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
   "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
   "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-  "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.";
+  "After the call returns, END YOUR TURN — do not keep working and do not start any other work. " +
+  "The sub-agent owns the task you delegated: continuing it, its follow-ups, or anything it might cover is redundant duplicate work that wastes tokens. " +
+  "The only thing you may still do before ending your turn is spawn or resume additional subagents to batch parallel work. " +
+  "Then end your turn and wait — the harness will wake you with the result. " +
+  "Each subagent reports separately: several spawns mean several pings. Consume each result as it arrives, but do not start or continue work that overlaps subagents still running, and do not treat the task as complete until all of them have reported.";
 
 // ── setup-hint stubs (outside herdr, no other subagent provider) ────────────
 
@@ -764,7 +768,12 @@ const RESUME_DESCRIPTION =
   "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
   "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
   "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
-  "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
+  "DO NOT fabricate or assume results. " +
+  "After the call returns, END YOUR TURN — do not keep working and do not start any other work. " +
+  "The resumed session owns the task you delegated: continuing it, its follow-ups, or anything it might cover is redundant duplicate work that wastes tokens. " +
+  "The only thing you may still do before ending your turn is resume or spawn additional subagents to batch parallel work. " +
+  "Then end your turn and wait — the harness will wake you with the result. " +
+  "Multiple resumed sessions also report separately — consume each result as it arrives, but do not start work overlapping sessions still running, and do not treat the task as complete until all have reported. " +
   "Use when a sub-agent was cancelled or needs follow-up work.";
 
 async function executeSubagentResume(
