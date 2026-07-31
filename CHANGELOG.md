@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Recursion guard**: subagents can no longer create subagents. The `subagent` and
+  `subagent_resume` tools reject calls made from inside a subagent (detected via the
+  `PI_SUBAGENT_ID` env var that every launch script exports) with a `recursive spawn blocked`
+  error. Subagents are now strictly one level deep — only the top-level session can spawn or
+  resume.
+- Removed the child-side "keep nested orchestrator alive" auto-exit machinery
+  (`src/runtime-state.ts` and the active-subagent count) — it only existed so a subagent
+  could stay alive while its own nested children ran, which the recursion guard makes
+  impossible.
+
 ## v0.2.0
 
 Breaking changes vs upstream `modem-dev/pi-herdr-subagents` @ `c833a55`:

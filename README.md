@@ -172,6 +172,17 @@ runtime fallback; `/subagents-init` explicitly copies them into one of these use
 locations. A `subagent_done` / `caller_ping` child extension is loaded into every child for the
 completion handshake.
 
+### Recursion guard: subagents cannot create subagents
+
+Subagents are **one level deep**. A subagent cannot spawn (`subagent`) or resume
+(`subagent_resume`) subagents — the tools reject the call with a clear error
+(`recursive spawn blocked`) and instruct the subagent to complete its delegated work itself.
+Only the top-level session can create subagents, so recursive orchestrator trees (subagents
+spawning grandchildren) are impossible by construction. This applies to every subagent
+regardless of agent-def `spawning` frontmatter. `spawning: false` / `deny-tools` still works
+to hide the spawn tools from an agent entirely (they are not registered in its process)
+instead of surfacing the rejection error.
+
 ## Lifecycle: every child ends in exactly one honest state
 
 The watcher classifies each child from socket events + sidecar files. There is **no path to an

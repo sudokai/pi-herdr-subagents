@@ -26,6 +26,7 @@ const ENV_KEYS = [
   "HERDR_TAB_ID",
   "PI_DENY_TOOLS",
   "PI_SUBAGENT_AGENT",
+  "PI_SUBAGENT_ID",
   "PI_HERDR_PI_BIN",
   "PI_CODING_AGENT_DIR",
 ] as const;
@@ -360,6 +361,22 @@ describe("index tools: subagent_resume", () => {
     );
     assert.equal(result.details.error, "session not found");
     assert.match(result.content[0].text, /session file not found/);
+  });
+
+  it("rejects resume from inside a subagent (recursion guard)", async () => {
+    const fake = registerAll();
+    makeFixture();
+    process.env.PI_SUBAGENT_ID = "abc123";
+    const tool = fake.findTool("subagent_resume");
+    const result = await tool.execute(
+      "t1",
+      { sessionPath: "/nonexistent/child.jsonl" },
+      undefined,
+      undefined,
+      makeFakeCtx().ctx,
+    );
+    assert.equal(result.details.error, "recursive spawn blocked");
+    assert.match(result.content[0].text, /cannot resume or create subagents/);
   });
 
   it("clears stale sidecars, launches via argv, and extracts only NEW entries for the summary", async () => {

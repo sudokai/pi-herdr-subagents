@@ -6,7 +6,6 @@ import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import herdrSubagents, { __test__, createHerdrSubagentsExtension } from "../index.ts";
-import { getActiveSubagentCount } from "../src/runtime-state.ts";
 import type { SubagentOutcome } from "../src/watcher.ts";
 
 const INDEX_PATH = resolve(dirname(fileURLToPath(import.meta.url)), "..", "index.ts");
@@ -22,6 +21,7 @@ const ENV_KEYS = [
   "HERDR_TAB_ID",
   "PI_DENY_TOOLS",
   "PI_SUBAGENT_AGENT",
+  "PI_SUBAGENT_ID",
   "PI_HERDR_PI_BIN",
   "PI_CODING_AGENT_DIR",
 ] as const;
@@ -367,6 +367,48 @@ describe("index: subagent tool", () => {
     assert.match(result.content[0].text, /worker/);
   });
 
+  it("recursive spawn is blocked (subagents cannot create subagents)", async () => {
+    const { tool } = registerAndGetTool();
+    process.env.PI_SUBAGENT_ID = "abc123";
+    const { ctx } = makeFakeCtx();
+
+    const result = await tool.execute(
+      "t1",
+      { name: "Worker", task: "do it", agent: "worker" },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    assert.equal(result.details.error, "recursive spawn blocked");
+    assert.match(result.content[0].text, /cannot create subagents/);
+    assert.equal(result.details.id, undefined); // nothing was launched
+  });
+
+  it("PI_SUBAGENT_AGENT alone does not trigger the recursion guard", async () => {
+    // The guard keys on PI_SUBAGENT_ID only — PI_SUBAGENT_AGENT is exported
+    // just for named-agent launches, so it cannot identify subagents launched
+    // without one. A session carrying only PI_SUBAGENT_AGENT must still spawn.
+    const { tool } = registerAndGetTool();
+    const fx = makeSpawnFixture();
+    __test__.setDeps({
+      client: makeFakeClient(),
+      watch: async () => ({ kind: "completed", summary: "done", exitCode: 0 }),
+      createStream: () => makeFakeStream() as any,
+    });
+    process.env.PI_SUBAGENT_AGENT = "worker";
+
+    const result = await tool.execute(
+      "t1",
+      { name: "Scout", task: "do it" },
+      undefined,
+      undefined,
+      fx.ctx,
+    );
+
+    assert.equal(result.details.status, "started");
+  });
+
   it("requires a persistent session file", async () => {
     const { tool } = registerAndGetTool();
     const { ctx } = makeFakeCtx({ sessionFile: null });
@@ -513,28 +555,6 @@ describe("index: subagent tool", () => {
     assert.doesNotMatch(fake.sent[0].message.content, /Context:/);
     assert.equal("contextUsage" in fake.sent[0].message.details, false);
     assert.equal(existsSync(telemetryPath), false, "stale telemetry is consumed");
-  });
-
-  it("publishes the active watcher count for nested orchestrator auto-exit", async () => {
-    const { tool } = registerAndGetTool();
-    const fx = makeSpawnFixture();
-
-    let settle!: (outcome: SubagentOutcome) => void;
-    const pending = new Promise<SubagentOutcome>((resolve) => {
-      settle = resolve;
-    });
-    __test__.setDeps({
-      client: makeFakeClient(),
-      watch: async () => pending,
-      createStream: () => makeFakeStream() as any,
-    });
-
-    await tool.execute("t1", { name: "Worker", task: "do it" }, undefined, undefined, fx.ctx);
-    assert.equal(getActiveSubagentCount(), 1);
-
-    settle({ kind: "completed", summary: "done", exitCode: 0 });
-    await waitFor(() => __test__.runningSubagents.size === 0);
-    assert.equal(getActiveSubagentCount(), 0);
   });
 
   it("cancelled outcome sends no steer message", async () => {

@@ -50,7 +50,6 @@ import {
   renderSubagentPing,
   renderSubagentResult,
 } from "./src/messages.ts";
-import { markSubagentActive, markSubagentInactive } from "./src/runtime-state.ts";
 import { findLastAssistantMessage, getNewEntries, seedSubagentSessionFile } from "./src/session.ts";
 import {
   watchSubagent,
@@ -345,7 +344,6 @@ function armWatcher(
   moduleSignal.addEventListener("abort", onModuleAbort, { once: true });
 
   runningSubagents.set(running.id, running);
-  markSubagentActive(running.id);
   startWidgetRefresh();
 
   void deps
@@ -357,7 +355,6 @@ function armWatcher(
     .then(async (outcome) => {
       runningSubagents.delete(running.id);
       maybeResetSubagentPaneLayout(runningSubagents.size);
-      markSubagentInactive(running.id);
       updateWidget();
       await closeSubagentPaneIfNeeded(running, outcome);
       const contextUsage =
@@ -374,7 +371,6 @@ function armWatcher(
     .catch((err: any) => {
       runningSubagents.delete(running.id);
       maybeResetSubagentPaneLayout(runningSubagents.size);
-      markSubagentInactive(running.id);
       updateWidget();
       pi.sendMessage(
         {
@@ -468,7 +464,8 @@ const SUBAGENT_DESCRIPTION_BASE =
   "The sub-agent owns the task you delegated: continuing it, its follow-ups, or anything it might cover is redundant duplicate work that wastes tokens. " +
   "The only thing you may still do before ending your turn is spawn or resume additional subagents to batch parallel work. " +
   "Then end your turn and wait — the harness will wake you with the result. " +
-  "Each subagent reports separately: several spawns mean several pings. Consume each result as it arrives, but do not start or continue work that overlaps subagents still running, and do not treat the task as complete until all of them have reported.";
+  "Each subagent reports separately: several spawns mean several pings. Consume each result as it arrives, but do not start or continue work that overlaps subagents still running, and do not treat the task as complete until all of them have reported." +
+  " Spawning is reserved for the top-level session — if you are a subagent you cannot spawn subagents.";
 
 // ── setup-hint stubs (outside herdr, no other subagent provider) ────────────
 
@@ -507,6 +504,21 @@ function errorResult(text: string, error: string) {
   };
 }
 
+/**
+ * True when this pi process is itself a subagent — i.e. it was started by
+ * this extension's launch script and is running inside a herdr pane spawned
+ * by a parent session. Used to enforce the recursion guard: subagents cannot
+ * create subagents.
+ *
+ * Every launch script exports PI_SUBAGENT_ID unconditionally, so its presence
+ * marks a subagent. PI_SUBAGENT_AGENT alone is unreliable for this — it is
+ * only exported when the subagent was launched with a named agent definition,
+ * so it misses subagents launched without one.
+ */
+function isSubagentProcess(): boolean {
+  return Boolean(process.env.PI_SUBAGENT_ID);
+}
+
 async function executeSubagentSpawn(
   pi: ExtensionAPI,
   params: BaseSpawnParams & Record<string, unknown>,
@@ -524,6 +536,17 @@ async function executeSubagentSpawn(
   },
   opts: Pick<HerdrSubagentsOptions, "expandLaunchParams"> & { expansionParamKeys?: string[] },
 ) {
+  // Subagents cannot create subagents — enforce the recursion guard first so
+  // a subagent can never reach the launch machinery.
+  if (isSubagentProcess()) {
+    return errorResult(
+      "You are a subagent — you cannot create subagents. " +
+        "You were spawned to do this work yourself. " +
+        "Complete the task directly and report back; spawning is reserved for the top-level session.",
+      "recursive spawn blocked",
+    );
+  }
+
   // Prevent self-spawning (e.g. planner spawning another planner)
   const currentAgent = process.env.PI_SUBAGENT_AGENT;
   if (params.agent && currentAgent && params.agent === currentAgent) {
@@ -774,7 +797,8 @@ const RESUME_DESCRIPTION =
   "The only thing you may still do before ending your turn is resume or spawn additional subagents to batch parallel work. " +
   "Then end your turn and wait — the harness will wake you with the result. " +
   "Multiple resumed sessions also report separately — consume each result as it arrives, but do not start work overlapping sessions still running, and do not treat the task as complete until all have reported. " +
-  "Use when a sub-agent was cancelled or needs follow-up work.";
+  "Use when a sub-agent was cancelled or needs follow-up work." +
+  " Resuming is reserved for the top-level session — if you are a subagent you cannot resume sessions.";
 
 async function executeSubagentResume(
   pi: ExtensionAPI,
@@ -788,6 +812,17 @@ async function executeSubagentResume(
     };
   },
 ) {
+  // Resume launches a new subagent pane, so the recursion guard applies here
+  // as well.
+  if (isSubagentProcess()) {
+    return errorResult(
+      "You are a subagent — you cannot resume or create subagents. " +
+        "You were spawned to do this work yourself. " +
+        "Complete the task directly and report back; resuming is reserved for the top-level session.",
+      "recursive spawn blocked",
+    );
+  }
+
   if (!existsSync(params.sessionPath)) {
     return errorResult(
       `Error: session file not found: ${params.sessionPath}`,
@@ -1300,7 +1335,6 @@ export function createHerdrSubagentsExtension(
     stopWidgetRefresh();
     for (const running of runningSubagents.values()) {
       running.abortController?.abort();
-      markSubagentInactive(running.id);
     }
     runningSubagents.clear();
     latestAgentStatuses.clear();
@@ -1344,7 +1378,6 @@ export const __test__ = {
     deps = defaultDeps();
     for (const running of runningSubagents.values()) {
       running.abortController?.abort();
-      markSubagentInactive(running.id);
     }
     runningSubagents.clear();
     latestAgentStatuses.clear();
