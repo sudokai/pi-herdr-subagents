@@ -1,14 +1,15 @@
-// LaunchPlan builder — agent defs + tool params → artifacts + wrapper script + agent-start argv.
+// LaunchPlan builder — agent defs + tool params → artifacts + wrapper script + plugin-pane launch.
 //
 // Pure planning module: no herdr calls, no subprocesses. index.ts executes the
-// plan (write plan.files, seed plan.seedSession, client.agentStart(plan.agentStart)).
+// plan (write plan.files, seed plan.seedSession, client.paneStart(plan.paneStart)).
 // The only filesystem side effect here is getDefaultSessionDirFor() creating the
 // child session directory (ported behavior from pi-interactive-subagents).
 //
 // Design (PLAN.md Key Decisions #4–#7):
 // - The generated wrapper script is the single place env/wrapping/exit-capture
-//   happens. herdr launches it via pane split + pane run (`bash <script>`) — no
-//   shell typing, no launch race, no verify/retry machinery.
+//   happens. Herdr passes its path to the fixed plugin dispatcher (or, for the
+//   fork's generic argv contract, to the plugin's `argv` entrypoint) — no shell
+//   typing, launch race, or verify/retry machinery.
 // - Env correctness for direnv/devenv repos: the script exports the
 //   orchestrator's PATH + curated PI_SUBAGENT_* vars (never a full env dump),
 //   and wraps the pi invocation in `direnv exec '<cwd>'` when the target cwd
@@ -94,13 +95,14 @@ export interface LaunchPlan {
     childSessionFile: string;
     childCwd: string;
   };
-  /** Arguments for HerdrClient.agentStart(). */
-  agentStart: {
+  /** Arguments for HerdrClient.paneStart(). */
+  paneStart: {
     name: string;
     cwd: string;
-    tabId?: string;
-    split?: "right" | "down";
-    argv: string[];
+    /** Orchestrator's own pane (HERDR_PANE_ID) — the new pane splits off it. */
+    targetPaneId?: string;
+    direction?: "right" | "down";
+    launchScriptFile: string;
   };
   /** The unescaped pi invocation embedded in the wrapper script (piArgv[0] = binary). */
   piArgv: string[];
@@ -272,7 +274,12 @@ function buildWrapperScript(opts: {
     `cd ${shellEscape(opts.cwd)}`,
     piCommand,
     'code=$?',
-    `echo "$code" > ${shellEscape(`${opts.sessionFile}.exitcode`)}`,
+    // Stamp the run id so the watcher can decide ownership of this sidecar
+    // outright. Resume reuses the session path, so a previous run's wrapper
+    // can land its sidecar after ours was cleared; without the id the watcher
+    // has to infer ownership from whether the pane is still alive, which is a
+    // race whenever pane teardown is slower than the sidecar write.
+    `echo "$code $PI_SUBAGENT_ID" > ${shellEscape(`${opts.sessionFile}.exitcode`)}`,
     ...(holdOpenSecs > 0
       ? [
           `if [ "$code" -ne 0 ] && [ "$SECONDS" -lt ${holdOpenSecs} ]; then`,
@@ -455,12 +462,12 @@ export function buildLaunchPlan(
     syspromptFile,
     files,
     seedSession,
-    agentStart: {
+    paneStart: {
       name: params.name,
       cwd: targetCwd,
-      tabId: env.HERDR_TAB_ID,
-      split: "right",
-      argv: ["bash", launchScriptFile],
+      targetPaneId: env.HERDR_PANE_ID,
+      direction: "right",
+      launchScriptFile,
     },
     piArgv,
     interactive,
@@ -496,12 +503,12 @@ export interface ResumeLaunchPlan {
   resumeMessageFile: string | null;
   /** Files the executor must write (mkdir -p dirname first). Includes the launch script. */
   files: Array<{ path: string; content: string }>;
-  agentStart: {
+  paneStart: {
     name: string;
     cwd: string;
-    tabId?: string;
-    split?: "right" | "down";
-    argv: string[];
+    targetPaneId?: string;
+    direction?: "right" | "down";
+    launchScriptFile: string;
   };
   piArgv: string[];
   interactive: boolean;
@@ -583,12 +590,12 @@ export function buildResumeLaunchPlan(
     launchScriptFile,
     resumeMessageFile,
     files,
-    agentStart: {
+    paneStart: {
       name: displayName,
       cwd: ctx.parentCwd,
-      tabId: env.HERDR_TAB_ID,
-      split: "right",
-      argv: ["bash", launchScriptFile],
+      targetPaneId: env.HERDR_PANE_ID,
+      direction: "right",
+      launchScriptFile,
     },
     piArgv,
     interactive,

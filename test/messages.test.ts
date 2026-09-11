@@ -125,8 +125,15 @@ describe("buildOutcomeMessage", () => {
     assert.equal(msg.details.sessionFile, "/tmp/sessions/child.jsonl");
   });
 
-  it("launch-failed → names exit code, pane id, launch script; heldOpen mentions post-mortem", () => {
-    const msg = build({ kind: "launch-failed", exitCode: 7, heldOpen: true });
+  it("launch-failed → includes the captured pane tail in content and details", () => {
+    const paneOutput =
+      "direnv: error /tmp/project/.envrc is blocked. Run `direnv allow` to approve its content\n";
+    const msg = build({
+      kind: "launch-failed",
+      exitCode: 7,
+      heldOpen: true,
+      paneOutput,
+    });
     assert.ok(msg);
     assert.equal(msg.customType, "subagent_result");
     assert.match(msg.content, /failed to launch/);
@@ -134,24 +141,51 @@ describe("buildOutcomeMessage", () => {
     assert.match(msg.content, /w1:p4/);
     assert.match(msg.content, /\/tmp\/artifacts\/subagent-scripts\/worker-sub1\.sh/);
     assert.match(msg.content, /left open for post-mortem/);
+    assert.match(msg.content, /Pane output \(last 20 lines\):/);
+    assert.match(msg.content, /\.envrc is blocked/);
     assert.match(msg.content, /bash '\/tmp\/artifacts\/subagent-scripts\/worker-sub1\.sh'/);
     assert.equal(msg.details.error, "launch-failed");
+    assert.equal(msg.details.paneOutput, paneOutput);
     assert.equal(msg.details.exitCode, 7);
     assert.equal(msg.details.launchScriptFile, "/tmp/artifacts/subagent-scripts/worker-sub1.sh");
   });
 
-  it("launch-failed without heldOpen omits the post-mortem line but keeps remediation", () => {
-    const msg = build({ kind: "launch-failed", exitCode: 7, heldOpen: false });
+  it("launch-failed with empty capture says explicitly that the pane produced no output", () => {
+    const msg = build({ kind: "launch-failed", exitCode: 7, heldOpen: false, paneOutput: "" });
     assert.ok(msg);
     assert.doesNotMatch(msg.content, /left open for post-mortem/);
+    assert.match(msg.content, /Pane produced no output\./);
+    assert.doesNotMatch(msg.content, /Pane output \(last 20 lines\):\s*$/);
     assert.match(msg.content, /bash '\/tmp\/artifacts\/subagent-scripts\/worker-sub1\.sh'/);
+    assert.equal(msg.details.paneOutput, "");
   });
 
-  it("crashed → failed (exit code N) + summary + resumable session path", () => {
-    const msg = build({ kind: "crashed", exitCode: 1, summary: "I was mid-refactor." });
+  it("launch-failed with a FAILED capture does not claim the pane was empty", () => {
+    // null means the read timed out / errored / the pane had already vanished.
+    // We do not know whether there was output, so claiming "no output" would
+    // point the reader at the wrong root cause (missing binary vs. lost capture).
+    const msg = build({ kind: "launch-failed", exitCode: 7, heldOpen: false, paneOutput: null });
+    assert.ok(msg);
+    assert.match(msg.content, /Pane output unavailable/);
+    assert.doesNotMatch(
+      msg.content,
+      /Pane produced no output\./,
+      "a failed capture must not be reported as an empty pane",
+    );
+    assert.equal(msg.details.paneOutput, null);
+  });
+
+  it("crashed → failed (exit code N) + summary + pane tail + resumable session path", () => {
+    const msg = build({
+      kind: "crashed",
+      exitCode: 1,
+      summary: "I was mid-refactor.",
+      paneOutput: "fatal: socket closed\n",
+    });
     assert.ok(msg);
     assert.match(msg.content, /Sub-agent "Worker" failed \(exit code 1\)\./);
     assert.match(msg.content, /I was mid-refactor\./);
+    assert.match(msg.content, /fatal: socket closed/);
     assert.match(msg.content, /Resume: pi --session \/tmp\/sessions\/child\.jsonl/);
     assert.equal(msg.details.error, "crashed");
     assert.equal(msg.details.exitCode, 1);
@@ -244,12 +278,29 @@ describe("message renderers", () => {
     const output = lines.join("\n");
     assert.match(output, /Worker/);
     assert.match(output, /completed/);
+    assert.match(output, /Session: \/tmp\/sessions\/child\.jsonl/);
+    assert.doesNotMatch(output, /Resume:/, "resume command is not rendered in the widget");
+    assert.ok(output.indexOf("Session:") < output.indexOf("l1"), "session path is shown before the preview");
     assert.match(output, /l5/);
     assert.doesNotMatch(output, /l6/, "collapsed preview is capped at 5 lines");
     assert.match(output, /… 2 more lines/);
   });
 
-  it("subagent_result expanded shows full summary and session block", () => {
+  it("launch-failed expanded shows captured pane output", () => {
+    const msg = build({
+      kind: "launch-failed",
+      exitCode: 1,
+      heldOpen: true,
+      paneOutput: "error: missing extension file\n",
+    })!;
+    const rendered = renderSubagentResult(msg as any, { expanded: true } as any, createTheme() as any);
+    assert.ok(rendered);
+    const output = rendered.render(80).join("\n");
+    assert.match(output, /Pane output \(last 20 lines\):/);
+    assert.match(output, /missing extension file/);
+  });
+
+  it("subagent_result expanded shows full summary and session block exactly once near the top", () => {
     const msg = build({ kind: "completed", summary: "line-a\nline-b", exitCode: 0 })!;
     const rendered = renderSubagentResult(msg as any, { expanded: true } as any, createTheme() as any);
     assert.ok(rendered);
@@ -257,7 +308,9 @@ describe("message renderers", () => {
     assert.match(output, /line-a/);
     assert.match(output, /line-b/);
     assert.match(output, /Session: \/tmp\/sessions\/child\.jsonl/);
-    assert.match(output, /Resume: {2}pi --session/);
+    assert.doesNotMatch(output, /Resume:/, "resume command is not rendered in the widget");
+    assert.ok(output.indexOf("Session:") < output.indexOf("line-a"), "session path is shown before the summary");
+    assert.equal(output.match(/Session: \/tmp\/sessions\/child\.jsonl/g)?.length, 1);
   });
 
   it("subagent_result renders failure statuses honestly", () => {
@@ -283,6 +336,9 @@ describe("message renderers", () => {
     const collapsedOut = collapsed.render(80).join("\n");
     assert.match(collapsedOut, /Worker/);
     assert.match(collapsedOut, /needs help/);
+    assert.match(collapsedOut, /Session: \/tmp\/sessions\/child\.jsonl/);
+    assert.doesNotMatch(collapsedOut, /Resume:/, "resume command is not rendered in the widget");
+    assert.ok(collapsedOut.indexOf("Session:") < collapsedOut.indexOf("first line"));
     assert.match(collapsedOut, /first line/);
     assert.doesNotMatch(collapsedOut, /second line/);
 
@@ -291,6 +347,9 @@ describe("message renderers", () => {
     const expandedOut = expanded.render(80).join("\n");
     assert.match(expandedOut, /second line/);
     assert.match(expandedOut, /Session: \/tmp\/sessions\/child\.jsonl/);
+    assert.doesNotMatch(expandedOut, /Resume:/, "resume command is not rendered in the widget");
+    assert.ok(expandedOut.indexOf("Session:") < expandedOut.indexOf("first line"));
+    assert.equal(expandedOut.match(/Session: \/tmp\/sessions\/child\.jsonl/g)?.length, 1);
   });
 
   it("renderers return undefined for messages without details", () => {
@@ -320,6 +379,73 @@ describe("message renderers", () => {
     assert.match(output, /✓/, "should show checkmark, not X");
     assert.match(output, /completed/, "should show completed status");
     assert.doesNotMatch(output, /✗/, "should NOT show failure X");
+  });
+
+  it("shows the session uuid on one line and no resume command", () => {
+    const uuid = "01a05eb1-ab3c-7e90-98ba-0ad1e767a2f0";
+    const longPath =
+      "/Users/justin/.pi/agent/sessions/--Users-justin-DEV-pi-herdr-subagents--/2026-09-01T20-38-16-828Z_dffdb49f-b11847cf-cd020f47-eb15.jsonl";
+    const msg = {
+      customType: "subagent_result",
+      display: true,
+      details: {
+        name: "Worker",
+        agent: "worker",
+        exitCode: 0,
+        disposition: "completed",
+        elapsed: 65,
+        summary: "Did the thing.",
+        sessionFile: longPath,
+        sessionId: uuid,
+      },
+    };
+    const collapsed = renderSubagentResult(msg as any, { expanded: false } as any, createTheme() as any);
+    assert.ok(collapsed);
+    const out = collapsed.render(80).join("\n");
+    assert.ok(
+      out.includes(`Session: ${uuid}`),
+      "session line should use the uuid, unwrapped, on a single line",
+    );
+    assert.ok(!out.includes("Resume:"), "no resume command line should be rendered");
+    assert.ok(!out.includes(longPath), "collapsed view should not carry the long path");
+
+    // Expanded keeps the full path available for reference.
+    const expanded = renderSubagentResult(msg as any, { expanded: true } as any, createTheme() as any);
+    assert.ok(expanded);
+    const expandedOut = expanded.render(80).join("\n").replace(/\s+/g, "");
+    assert.ok(expandedOut.includes(longPath), "expanded view should still expose the full path");
+  });
+
+  it("never truncates the session path, even at narrow widths (must stay copy-pastable)", () => {
+    // Real session paths are ~135 chars and exceed any normal terminal width.
+    // These lines exist to be copy-pasted, so they must not be width-clipped.
+    const longPath =
+      "/Users/justin/.pi/agent/sessions/--Users-justin-DEV-pi-herdr-subagents--/2026-09-01T20-38-16-828Z_dffdb49f-b11847cf-cd020f47-eb15.jsonl";
+    const msg = {
+      customType: "subagent_result",
+      display: true,
+      details: {
+        name: "Worker",
+        agent: "worker",
+        exitCode: 0,
+        disposition: "completed",
+        elapsed: 65,
+        summary: "Did the thing.",
+        sessionFile: longPath,
+      },
+    };
+    for (const expanded of [false, true]) {
+      const rendered = renderSubagentResult(msg as any, { expanded } as any, createTheme() as any);
+      assert.ok(rendered);
+      const output = rendered.render(80).join("\n");
+      // The box hard-wraps long lines, so the path may span rows; what must NOT
+      // happen is losing characters to width truncation.
+      const unwrapped = output.replace(/\s+/g, "");
+      assert.ok(
+        unwrapped.includes(longPath),
+        `session path must not be clipped at width 80 (expanded=${expanded})`,
+      );
+    }
   });
 
   it("renders old pi-interactive-subagents failed steer messages as failure", () => {

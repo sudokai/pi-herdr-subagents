@@ -21,8 +21,9 @@
 // later resume of the same session cannot see stale completion signals. It
 // does NOT touch the runningSubagents map — removal is the caller's job.
 //
-// Anti-patterns deliberately absent: no `pane read` screen scraping, no stall
-// detection/status transitions (discarded per plan §9).
+// Pane text is never used for lifecycle detection. A bounded, best-effort
+// `pane read` captures diagnostics only after a failure has been classified.
+// Stall detection/status transitions remain absent (discarded per plan §9).
 import { readFileSync, rmSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { basename, dirname } from "node:path";
 
@@ -46,8 +47,8 @@ export type SubagentOutcome =
   | { kind: "completed"; summary: string; exitCode: 0 }
   | { kind: "completed-user-exit"; summary: string; exitCode: 0 } // no .exit sidecar
   | { kind: "ping"; name: string; message: string }
-  | { kind: "launch-failed"; exitCode: number; heldOpen: boolean }
-  | { kind: "crashed"; exitCode: number; summary: string | null }
+  | { kind: "launch-failed"; exitCode: number; heldOpen: boolean; paneOutput: string | null }
+  | { kind: "crashed"; exitCode: number; summary: string | null; paneOutput: string | null }
   | { kind: "pane-killed"; summary: string | null }
   | { kind: "gap-exit"; summary: string | null; exitCode: number | null }
   | { kind: "cancelled" };
@@ -55,6 +56,7 @@ export type SubagentOutcome =
 export interface WatcherDeps {
   client: {
     paneGet(paneId: string): Promise<PaneInfo | null>;
+    paneRead(paneId: string, lines: number, signal?: AbortSignal): Promise<string | null>;
     paneList(): Promise<PaneInfo[]>;
   };
   stream: {
@@ -72,6 +74,8 @@ export interface WatcherDeps {
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const DEFAULT_STARTUP_WINDOW_MS = 15_000;
+const PANE_TAIL_LINES = 20;
+const PANE_CAPTURE_TIMEOUT_MS = 100;
 
 type Trigger = "event" | "sidecar" | "gone";
 
@@ -130,6 +134,36 @@ export function watchSubagent(
       return findLastAssistantMessage(readSessionEntries());
     }
 
+    /**
+     * Capture diagnostics while a failed pane may still exist. The strict time
+     * budget keeps a slow or wedged herdr CLI from delaying the failure steer.
+     */
+    function capturePaneTail(): Promise<string | null> {
+      return new Promise((resolveCapture) => {
+        let settled = false;
+        const controller = new AbortController();
+        const settle = (output: string | null) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolveCapture(output);
+        };
+        const timer = setTimeout(() => {
+          controller.abort();
+          settle(null);
+        }, PANE_CAPTURE_TIMEOUT_MS);
+        timer.unref?.();
+
+        try {
+          void deps.client
+            .paneRead(running.paneId, PANE_TAIL_LINES, controller.signal)
+            .then(settle, () => settle(null));
+        } catch {
+          settle(null);
+        }
+      });
+    }
+
     function readExitSidecar(): { type?: string; name?: string; message?: string } | null {
       try {
         return JSON.parse(readFileSync(exitFile, "utf8"));
@@ -138,14 +172,26 @@ export function watchSubagent(
       }
     }
 
-    function readExitCode(): number | null {
+    /**
+     * Parse the wrapper's exitcode sidecar. Current wrappers write
+     * "<code> <run id>"; wrappers from before id stamping wrote "<code>".
+     * A stamped id makes ownership decidable without inferring it from pane
+     * liveness (see the stale-sidecar guard in trySettle).
+     */
+    function readExitCode(): { code: number; id: string | null } | null {
       try {
-        const parsed = Number.parseInt(readFileSync(exitcodeFile, "utf8").trim(), 10);
-        return Number.isFinite(parsed) ? parsed : null;
+        const raw = readFileSync(exitcodeFile, "utf8").trim();
+        const [codeText, idText] = raw.split(/\s+/, 2);
+        const parsed = Number.parseInt(codeText, 10);
+        return Number.isFinite(parsed) ? { code: parsed, id: idText || null } : null;
       } catch {
         return null;
       }
     }
+
+    // Set by classify(): true when the exitcode sidecar it accepted carried our
+    // run id, so ownership is proven and the liveness guard can be skipped.
+    let exitcodeIdMatched = false;
 
     // ── classification matrix (normative — PLAN.md) ──
 
@@ -166,8 +212,18 @@ export function watchSubagent(
         };
       }
 
-      const exitCode = readExitCode();
-      if (exitCode !== null) {
+      const exitInfo = readExitCode();
+      if (exitInfo !== null) {
+        // A sidecar stamped with a different run's id is definitively not ours
+        // (resume reuses the session path). Consume it and keep watching.
+        if (exitInfo.id !== null && exitInfo.id !== running.id) {
+          try {
+            rmSync(exitcodeFile, { force: true });
+          } catch {}
+          return null;
+        }
+        exitcodeIdMatched = exitInfo.id !== null;
+        const exitCode = exitInfo.code;
         if (exitCode === 0) {
           // No .exit sidecar → the user drove the session and quit pi normally.
           return {
@@ -180,9 +236,14 @@ export function watchSubagent(
         if (withinStartupWindow && readSessionEntries().length === 0) {
           // Startup crash (e.g. bad --model). If the wrapper's hold-open kept
           // the pane alive, no pane event has fired — the sidecar is the signal.
-          return { kind: "launch-failed", exitCode, heldOpen: !paneEventSeen };
+          return {
+            kind: "launch-failed",
+            exitCode,
+            heldOpen: !paneEventSeen,
+            paneOutput: null,
+          };
         }
-        return { kind: "crashed", exitCode, summary: readSummary() };
+        return { kind: "crashed", exitCode, summary: readSummary(), paneOutput: null };
       }
 
       // No sidecars at all.
@@ -199,6 +260,20 @@ export function watchSubagent(
     }
 
     let staleCheckInFlight = false;
+    let paneCaptureInFlight = false;
+
+    function finishWithDiagnostics(outcome: SubagentOutcome, consumeSidecars: boolean): void {
+      if (outcome.kind !== "launch-failed" && outcome.kind !== "crashed") {
+        finish(outcome, consumeSidecars);
+        return;
+      }
+      if (paneCaptureInFlight) return;
+      paneCaptureInFlight = true;
+      void capturePaneTail().then((paneOutput) => {
+        if (done) return;
+        finish({ ...outcome, paneOutput }, consumeSidecars);
+      });
+    }
 
     function trySettle(trigger: Trigger): void {
       if (done) return;
@@ -207,12 +282,14 @@ export function watchSubagent(
 
       // Stale-sidecar guard: resuming a session whose previous pi is still
       // tearing down can see the OLD wrapper's exit-0 sidecar land AFTER
-      // wrapper's exit-0 sidecar land AFTER subagent_resume cleared it. An
+      // subagent_resume cleared it. An
       // exit-0 wrapper closes its pane immediately, so exit 0 signalled by a
       // sidecar while OUR pane is still alive cannot be ours — consume it and
       // keep watching. (Nonzero exits pass through: hold-open keeps the pane
       // alive on purpose, and pane events/reconcile prove the pane is gone.)
-      if (outcome.kind === "completed-user-exit" && trigger === "sidecar") {
+      // Only needed for unstamped (pre-id) sidecars; a matching stamped id
+      // already proves the sidecar is ours.
+      if (outcome.kind === "completed-user-exit" && trigger === "sidecar" && !exitcodeIdMatched) {
         if (staleCheckInFlight) return;
         staleCheckInFlight = true;
         void deps.client
@@ -236,7 +313,7 @@ export function watchSubagent(
         return;
       }
 
-      finish(outcome, true);
+      finishWithDiagnostics(outcome, true);
     }
 
     // ── signal source (a): pane events ──

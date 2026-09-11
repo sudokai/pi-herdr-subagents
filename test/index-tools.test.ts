@@ -132,9 +132,10 @@ function makeFakeCtx(overrides?: { cwd?: string; sessionDir?: string }) {
 
 function makeFakeClient(overrides?: Partial<Record<string, Function>>) {
   return {
-    async agentStart() {
+    async paneStart() {
       return { paneId: "w1:p9", terminalId: "", workspaceId: "", tabId: "" };
     },
+    async paneRename() {},
     async paneGet() {
       return null;
     },
@@ -144,7 +145,10 @@ function makeFakeClient(overrides?: Partial<Record<string, Function>>) {
     async paneClose() {},
     async paneSendKeys() {},
     async ping() {
-      return { ok: true, version: "0.7.1", protocol: 14 };
+      return { ok: true, version: "0.8.2", protocol: 14 };
+    },
+    async pluginGet() {
+      return { plugin_id: "pi-herdr-subagents", enabled: true };
     },
     ...overrides,
   } as any;
@@ -379,7 +383,7 @@ describe("index tools: subagent_resume", () => {
     assert.match(result.content[0].text, /cannot resume or create subagents/);
   });
 
-  it("clears stale sidecars, launches via argv, and extracts only NEW entries for the summary", async () => {
+  it("clears stale sidecars, launches via the dispatcher, and extracts only NEW entries for the summary", async () => {
     const fake = registerAll();
     const fx = makeFixture();
 
@@ -400,15 +404,15 @@ describe("index tools: subagent_resume", () => {
     );
 
     let sidecarsAtLaunch: boolean | null = null;
-    let launchedArgv: string[] | null = null;
+    let launchedScript: string | null = null;
     __test__.setDeps({
       client: makeFakeClient({
-        agentStart: async (p: any) => {
+        paneStart: async (p: any) => {
           sidecarsAtLaunch =
             existsSync(`${sessionPath}.exit`) ||
             existsSync(`${sessionPath}.exitcode`) ||
             existsSync(`${sessionPath}.context-usage`);
-          launchedArgv = p.argv;
+          launchedScript = p.launchScriptFile;
           return { paneId: "w1:p7", terminalId: "", workspaceId: "", tabId: "" };
         },
       }),
@@ -432,10 +436,9 @@ describe("index tools: subagent_resume", () => {
     assert.equal(result.details.status, "started");
     assert.equal(result.details.paneId, "w1:p7");
     assert.equal(sidecarsAtLaunch, false, "stale sidecars removed before launch");
-    assert.ok(launchedArgv, "agentStart called");
-    assert.equal(launchedArgv![0], "bash");
+    assert.ok(launchedScript, "paneStart called");
 
-    const script = readFileSync(launchedArgv![1], "utf8");
+    const script = readFileSync(launchedScript!, "utf8");
     assert.match(script, /--session/);
     assert.ok(script.includes(sessionPath), "script resumes the given session");
     assert.match(script, /@.*subagent-resume/, "resume message delivered via @artifact");
@@ -740,7 +743,7 @@ describe("index tools: commands", () => {
     let launchCount = 0;
     __test__.setDeps({
       client: makeFakeClient({
-        agentStart: async () => {
+        paneStart: async () => {
           launchCount += 1;
           return { paneId: "w1:p9", terminalId: "", workspaceId: "", tabId: "" };
         },
@@ -767,7 +770,7 @@ describe("index tools: commands", () => {
     let launchCount = 0;
     __test__.setDeps({
       client: makeFakeClient({
-        agentStart: async () => {
+        paneStart: async () => {
           launchCount += 1;
           return { paneId: "w1:p9", terminalId: "", workspaceId: "", tabId: "" };
         },

@@ -41,7 +41,6 @@ description: Integration test agent — invalid model, crashes pi at startup
 model: nonexistent/bogus-model-xyz
 tools: read, bash
 spawning: false
-auto-exit: true
 disable-model-invocation: true
 ---
 
@@ -53,7 +52,7 @@ name: test-wait
 description: Integration test agent — does the task, then waits for the user
 tools: read, bash
 spawning: false
-auto-exit: false
+interactive: true
 disable-model-invocation: true
 ---
 
@@ -231,7 +230,7 @@ describe(
         `Call the subagent tool exactly once with these EXACT parameters:`,
         `name: "Wait-${id}"`,
         `agent: "test-wait"`,
-        `task: "Use the bash tool to run: echo WAITING_${id} > ${marker} — then wait for further instructions."`,
+        `task: "Use the bash tool to run: echo WAITING_${id} > ${marker} && sleep 60 — then wait for further instructions."`,
         `Do nothing else. When a result arrives later, do NOT retry — reply NOTED.`,
       ].join("\n");
 
@@ -249,12 +248,14 @@ describe(
           debug,
         });
 
-      // Let the child finish its turn, then quit pi like a user would
-      // (double ctrl+c on an idle editor).
-      await sleep(5_000);
+      // Quit pi like a user would while the child is still in the deliberate
+      // sleep. This prevents the model from following the generic interactive
+      // completion hint and calling subagent_done before the harness can act.
       const panes = await ts.client.paneList();
       const childPane = panes.find((p) => (p as any).label === `Wait-${id}`)?.pane_id;
       assert.ok(childPane, `child pane for Wait-${id} should exist:\n${await dumpPanes(ts)}`);
+      await ts.client.paneSendKeys(childPane, ["escape"]);
+      await sleep(1_000);
       await ts.client.paneSendKeys(childPane, ["ctrl+c"]);
       await sleep(400);
       await ts.client.paneSendKeys(childPane, ["ctrl+c"]);

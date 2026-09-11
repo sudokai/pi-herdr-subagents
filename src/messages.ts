@@ -40,6 +40,25 @@ function sessionRef(sessionFile: string | undefined): string {
   return sessionFile ? `\n\nSession: ${sessionFile}\nResume: pi --session ${sessionFile}` : "";
 }
 
+/**
+ * Three distinct outcomes, deliberately NOT collapsed into one message:
+ *
+ *  - text        -> show it
+ *  - ""          -> the read succeeded and the pane was genuinely empty. Strong
+ *                   signal: the process died before writing anything, which
+ *                   points at a missing binary/file/argv rather than a runtime
+ *                   error inside the agent.
+ *  - null        -> the capture itself failed (timed out, errored, or the pane
+ *                   had already vanished). We do NOT know whether there was
+ *                   output, so claiming "no output" here would be a false
+ *                   diagnostic pointing at the wrong root cause.
+ */
+function paneOutputSection(paneOutput: string | null | undefined): string {
+  if (paneOutput == null) return "Pane output unavailable (capture failed, timed out, or pane closed).";
+  const output = paneOutput.trim();
+  return output ? `Pane output (last 20 lines):\n${output}` : "Pane produced no output.";
+}
+
 /** Ported: completed/failed presentation with Session:/Resume: block. */
 export function resolveResultPresentation(
   result: { exitCode: number; elapsed: number; summary: string; sessionFile?: string },
@@ -58,7 +77,12 @@ export function resolveResultPresentation(
 export function buildOutcomeMessage(
   running: RunningSubagent,
   outcome: SubagentOutcome,
-  opts?: { now?: () => number; contextUsage?: ContextUsageSnapshot | null },
+  opts?: {
+    now?: () => number;
+    contextUsage?: ContextUsageSnapshot | null;
+    /** Canonical pi session UUID, resolved once by the caller (see getSessionId). */
+    sessionId?: string | null;
+  },
 ): SubagentSteerMessage | null {
   const now = opts?.now ?? Date.now;
   const elapsed = Math.max(0, Math.floor((now() - running.startTime) / 1000));
@@ -70,6 +94,7 @@ export function buildOutcomeMessage(
     agent: running.agent,
     elapsed,
     sessionFile: running.sessionFile,
+    ...(opts?.sessionId ? { sessionId: opts.sessionId } : {}),
     paneId: running.paneId,
     disposition: outcome.kind,
     ...(opts?.contextUsage ? { contextUsage: opts.contextUsage } : {}),
@@ -113,9 +138,7 @@ export function buildOutcomeMessage(
       };
 
     case "launch-failed": {
-      const lines = [
-        `Sub-agent "${running.name}" failed to launch (exit code ${outcome.exitCode}).`,
-        "",
+      const summaryLines = [
         `Pane: ${running.paneId} (herdr)`,
         `Launch script: ${running.launchScriptFile}`,
         "",
@@ -123,9 +146,22 @@ export function buildOutcomeMessage(
         "To retry manually, run in that pane (or any shell):",
         `  bash '${running.launchScriptFile}'`,
       ];
+      const summary = summaryLines.join("\n");
+      const content = [
+        `Sub-agent "${running.name}" failed to launch (exit code ${outcome.exitCode}).`,
+        "",
+        `Pane: ${running.paneId} (herdr)`,
+        `Launch script: ${running.launchScriptFile}`,
+        "",
+        paneOutputSection(outcome.paneOutput),
+        "",
+        ...(outcome.heldOpen ? ["The pane was left open for post-mortem."] : []),
+        "To retry manually, run in that pane (or any shell):",
+        `  bash '${running.launchScriptFile}'`,
+      ].join("\n");
       return {
         customType: "subagent_result",
-        content: lines.join("\n") + usageSuffix,
+        content: content + usageSuffix,
         display: true,
         details: {
           ...baseDetails,
@@ -133,6 +169,8 @@ export function buildOutcomeMessage(
           error: "launch-failed",
           heldOpen: outcome.heldOpen,
           launchScriptFile: running.launchScriptFile,
+          summary,
+          paneOutput: outcome.paneOutput,
         },
       };
     }
@@ -145,13 +183,16 @@ export function buildOutcomeMessage(
           resolveResultPresentation(
             { exitCode: outcome.exitCode, elapsed, summary, sessionFile: running.sessionFile },
             running.name,
-          ) + usageSuffix,
+          ) +
+          `\n\n${paneOutputSection(outcome.paneOutput)}` +
+          usageSuffix,
         display: true,
         details: {
           ...baseDetails,
           exitCode: outcome.exitCode,
           error: "crashed",
           summary: outcome.summary,
+          paneOutput: outcome.paneOutput,
         },
       };
     }
@@ -267,17 +308,28 @@ export function renderSubagentResult(
       const contentLines = [header];
       const usageLine = formatContextUsageLine(details.contextUsage).trim();
       if (usageLine) contentLines.push(theme.fg("dim", usageLine));
+      // NOTE: deliberately not width-truncated. This line exists to be
+      // copy-pasted; a clipped path or id is useless. Prefer the session UUID:
+      // it fits on one line, whereas a ~135-char path hard-wraps across three.
+      // The full path stays available in the expanded view.
+      if (details.sessionFile) {
+        contentLines.push(theme.fg("dim", `Session: ${details.sessionId ?? details.sessionFile}`));
+      }
 
       if (options.expanded) {
+        if (details.sessionId && details.sessionFile) {
+          contentLines.push(theme.fg("dim", `Path:    ${details.sessionFile}`));
+        }
         if (summary) {
           for (const line of summary.split("\n")) {
             contentLines.push(line.slice(0, width - 6));
           }
         }
-        if (details.sessionFile) {
+        if (Object.prototype.hasOwnProperty.call(details, "paneOutput")) {
           contentLines.push("");
-          contentLines.push(theme.fg("dim", `Session: ${details.sessionFile}`));
-          contentLines.push(theme.fg("dim", `Resume:  pi --session ${details.sessionFile}`));
+          for (const line of paneOutputSection(details.paneOutput).split("\n")) {
+            contentLines.push(line.slice(0, width - 6));
+          }
         }
       } else {
         if (summary) {
@@ -321,14 +373,14 @@ export function renderSubagentPing(
       const contentLines = [header];
       const usageLine = formatContextUsageLine(details.contextUsage).trim();
       if (usageLine) contentLines.push(theme.fg("dim", usageLine));
+      // NOTE: deliberately not width-truncated (see renderSubagentResult).
+      if (details.sessionFile) {
+        contentLines.push(theme.fg("dim", `Session: ${details.sessionId ?? details.sessionFile}`));
+      }
 
       if (options.expanded) {
         contentLines.push("");
         contentLines.push(details.message ?? "");
-        if (details.sessionFile) {
-          contentLines.push("");
-          contentLines.push(theme.fg("dim", `Session: ${details.sessionFile}`));
-        }
       } else {
         const preview = (details.message ?? "").split("\n")[0].slice(0, width - 10);
         contentLines.push(theme.fg("dim", preview));

@@ -25,7 +25,7 @@ export interface PaneInfo {
   [key: string]: unknown;
 }
 
-export interface AgentStartResult {
+export interface PaneStartResult {
   paneId: string;
   terminalId: string;
   workspaceId: string;
@@ -38,22 +38,39 @@ export interface PingResult {
   protocol?: number | null;
 }
 
+export interface PluginInfo {
+  plugin_id: string;
+  enabled: boolean;
+  [key: string]: unknown;
+}
+
+export const HERDR_PLUGIN_ID = "pi-herdr-subagents";
+export const HERDR_PLUGIN_ENTRYPOINT = "subagent";
+export const HERDR_PLUGIN_ARGV_ENTRYPOINT = "argv";
+export const MIN_HERDR_VERSION = "0.8.2";
+
 export interface HerdrClient {
-  agentStart(p: {
+  /**
+   * Split a plugin-owned pane beside the orchestrator and dispatch one generated
+   * launch script through the plugin's fixed argv entrypoint. No shell typing,
+   * launch race, or per-call argv support is required from Herdr.
+   */
+  paneStart(p: {
     name: string;
     cwd: string;
-    tabId?: string;
-    split?: "right" | "down";
-    /** When set, split from this pane instead of the orchestrator's current pane. */
-    splitFromPaneId?: string;
+    targetPaneId?: string;
+    direction?: "right" | "down";
     env?: Record<string, string>;
-    argv: string[];
-  }): Promise<AgentStartResult>;
+    launchScriptFile: string;
+  }): Promise<PaneStartResult>;
+  paneRename(paneId: string, label: string): Promise<void>;
   paneGet(paneId: string): Promise<PaneInfo | null>;
+  paneRead(paneId: string, lines: number, signal?: AbortSignal): Promise<string | null>;
   paneList(): Promise<PaneInfo[]>;
   paneClose(paneId: string): Promise<void>;
   paneSendKeys(paneId: string, keys: string[]): Promise<void>;
   ping(): Promise<PingResult>;
+  pluginGet(pluginId: string): Promise<PluginInfo | null>;
 }
 
 interface HerdrJsonEnvelope {
@@ -159,36 +176,52 @@ export function createHerdrClient(opts?: { exec?: ExecFn; bin?: string }): Herdr
   }
 
   return {
-    async agentStart(p) {
-      // herdr ≥ 0.7.5: topology (split/cwd/env) is pane split; argv launch is pane run.
-      const splitArgs = [
+    async paneStart(p) {
+      const args = [
+        "plugin",
         "pane",
+        "open",
+        "--plugin",
+        HERDR_PLUGIN_ID,
+        "--entrypoint",
+        HERDR_PLUGIN_ENTRYPOINT,
+        "--placement",
         "split",
-        ...(p.splitFromPaneId ? [p.splitFromPaneId] : ["--current"]),
-        "--direction",
-        p.split ?? "right",
-        "--cwd",
-        p.cwd,
-        "--no-focus",
       ];
-      for (const [key, value] of Object.entries(p.env ?? {})) {
-        splitArgs.push("--env", `${key}=${value}`);
+      if (p.targetPaneId) args.push("--target-pane", p.targetPaneId);
+      args.push("--direction", p.direction ?? "right");
+      args.push("--cwd", p.cwd);
+      for (const [key, value] of Object.entries({
+        ...p.env,
+        PI_HERDR_LAUNCH_SCRIPT: p.launchScriptFile,
+      })) {
+        args.push("--env", `${key}=${value}`);
       }
+      args.push("--no-focus");
 
-      const splitResult = await execHerdrJson<{ pane?: PaneInfo }>(splitArgs);
-      const pane = splitResult.pane;
+      const result = await execHerdrJson<{
+        plugin_pane?: { pane?: Record<string, unknown> };
+      }>(args);
+      const pane = result.plugin_pane?.pane as
+        | { pane_id?: string; terminal_id?: string; workspace_id?: string; tab_id?: string }
+        | undefined;
       if (!pane?.pane_id) {
-        throw new HerdrError(`herdr pane split returned no pane id: ${JSON.stringify(splitResult)}`);
+        throw new HerdrError(
+          `herdr plugin pane open returned no pane id: ${JSON.stringify(result)}`,
+        );
       }
-
-      await execHerdr(["pane", "run", pane.pane_id, ...p.argv]);
-
       return {
         paneId: pane.pane_id,
         terminalId: pane.terminal_id ?? "",
         workspaceId: pane.workspace_id ?? "",
         tabId: pane.tab_id ?? "",
       };
+    },
+
+    async paneRename(paneId, label) {
+      // Best-effort sidebar label; success is exit 0 (output shape is not
+      // relied upon so this stays compatible across herdr versions).
+      await execHerdr(["pane", "rename", paneId, label]);
     },
 
     async paneGet(paneId) {
@@ -198,6 +231,31 @@ export function createHerdrClient(opts?: { exec?: ExecFn; bin?: string }): Herdr
       } catch (error) {
         if (error instanceof HerdrError && error.code === "pane_not_found") return null;
         throw error;
+      }
+    },
+
+    async paneRead(paneId, lines, signal) {
+      try {
+        const result = await execHerdr(
+          [
+            "pane",
+            "read",
+            paneId,
+            "--lines",
+            String(lines),
+            "--source",
+            "visible",
+            "--format",
+            "text",
+          ],
+          signal,
+        );
+        return result.stdout;
+      } catch (error) {
+        // Diagnostic capture is best-effort. In particular, panes can vanish
+        // between lifecycle classification and this read.
+        if (error instanceof HerdrError && error.code === "pane_not_found") return null;
+        return null;
       }
     },
 
@@ -211,8 +269,9 @@ export function createHerdrClient(opts?: { exec?: ExecFn; bin?: string }): Herdr
     },
 
     async paneSendKeys(paneId, keys) {
-      // Unlike the other pane commands, `pane send-keys` prints nothing on
-      // success — only demand exit 0; failures surface via the error envelope.
+      // Unlike the other pane commands, `pane send-keys` prints NOTHING on
+      // success (verified live against herdr 0.7.1) — only demand exit 0;
+      // failures still surface via the error envelope + nonzero exit.
       await execHerdr(["pane", "send-keys", paneId, ...keys]);
     },
 
@@ -228,6 +287,17 @@ export function createHerdrClient(opts?: { exec?: ExecFn; bin?: string }): Herdr
         throw new HerdrError(`Failed to parse herdr status output: ${stdout}`);
       }
       return { ok: status.running === true, version: status.version, protocol: status.protocol };
+    },
+
+    async pluginGet(pluginId) {
+      const result = await execHerdrJson<{ plugins?: PluginInfo[] }>([
+        "plugin",
+        "list",
+        "--plugin",
+        pluginId,
+        "--json",
+      ]);
+      return result.plugins?.find((plugin) => plugin.plugin_id === pluginId) ?? null;
     },
   };
 }

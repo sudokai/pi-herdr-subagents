@@ -148,6 +148,15 @@ export default function (pi: ExtensionAPI) {
   let userTookOver = false;
   let agentStarted = false;
   let contextUsageWritten = false;
+  let terminalSidecarWritten = false;
+
+  function signalTerminalSidecar(data: ExitSidecarData): void {
+    if (terminalSidecarWritten) return;
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
+    if (!sessionFile) return;
+    writeExitSidecar(sessionFile, data);
+    terminalSidecarWritten = true;
+  }
 
   function snapshotContextUsage(
     ctx: {
@@ -226,11 +235,8 @@ export default function (pi: ExtensionAPI) {
       // completion, not a user close. Most models finish and stop talking
       // without explicitly calling subagent_done — a clean auto-exit IS a
       // completion.
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (sessionFile) {
-        snapshotContextUsage(ctx);
-        writeExitSidecar(sessionFile, { type: "done" });
-      }
+      snapshotContextUsage(ctx);
+      signalTerminalSidecar({ type: "done" });
       ctx.shutdown();
       return;
     }
@@ -290,7 +296,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       snapshotContextUsage(ctx);
-      writeExitSidecar(sessionFile, {
+      signalTerminalSidecar({
         type: "ping",
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         message: params.message,
@@ -319,7 +325,7 @@ export default function (pi: ExtensionAPI) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (sessionFile) {
         snapshotContextUsage(ctx);
-        writeExitSidecar(sessionFile, { type: "done" });
+        signalTerminalSidecar({ type: "done" });
       }
       ctx.shutdown();
       return {

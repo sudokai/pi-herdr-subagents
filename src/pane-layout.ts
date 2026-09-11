@@ -2,8 +2,8 @@ import { equalizeTabLayout } from "./herdr/layout-equalize.ts";
 import type { RunningSubagent } from "./watcher.ts";
 
 export interface SubagentPaneSplit {
-  split: "right" | "down";
-  splitFromPaneId?: string;
+  direction: "right" | "down";
+  targetPaneId?: string;
 }
 
 /** Most recent subagent pane id, including launches not yet in `running`. */
@@ -25,18 +25,18 @@ export function resolveSubagentPaneSplit(
 ): SubagentPaneSplit {
   const runningList = [...running];
   if (runningList.length === 0 && !latestPaneId) {
-    return { split: "right" };
+    return { direction: "right" };
   }
 
   const anchor = runningList.reduce<RunningSubagent | undefined>(
     (latest, agent) => (!latest || agent.startTime >= latest.startTime ? agent : latest),
     undefined,
   );
-  const splitFromPaneId = anchor?.paneId ?? latestPaneId;
-  if (!splitFromPaneId) {
-    return { split: "right" };
+  const targetPaneId = anchor?.paneId ?? latestPaneId;
+  if (!targetPaneId) {
+    return { direction: "right" };
   }
-  return { split: "down", splitFromPaneId };
+  return { direction: "down", targetPaneId };
 }
 
 /** Serialize pane splits so concurrent launches get distinct layout slots. */
@@ -55,15 +55,18 @@ export async function withSerializedPaneLaunch<T>(fn: () => Promise<T>): Promise
 
 /** Resolve layout, start the pane, and record the new anchor pane id. */
 export async function startSubagentPaneWithLayout<
-  T extends { split?: "right" | "down"; splitFromPaneId?: string },
+  T extends { direction?: "right" | "down"; targetPaneId?: string },
 >(
-  agentStart: T,
+  paneStart: T,
   running: Iterable<RunningSubagent>,
-  agentStartFn: (payload: T) => Promise<{ paneId: string; tabId?: string }>,
+  paneStartFn: (payload: T) => Promise<{ paneId: string; tabId?: string }>,
 ): Promise<{ paneId: string; tabId?: string }> {
   return withSerializedPaneLaunch(async () => {
-    const { split, splitFromPaneId } = resolveSubagentPaneSplit(running, latestSubagentPaneId);
-    const started = await agentStartFn({ ...agentStart, split, splitFromPaneId });
+    const { direction, targetPaneId } = resolveSubagentPaneSplit(
+      running,
+      latestSubagentPaneId,
+    );
+    const started = await paneStartFn({ ...paneStart, direction, targetPaneId });
     latestSubagentPaneId = started.paneId;
 
     const socketPath = process.env.HERDR_SOCKET_PATH;

@@ -7,7 +7,7 @@
  *   2. interrupt: Escape lands in the running child's turn (verified via
  *      stopReason: "aborted" in the child session), no steer from the
  *      interrupt itself, child pane stays alive
- *   3. interactive positive variant: non-auto-exit child that calls
+ *   3. interactive positive variant: interactive child that calls
  *      subagent_done itself → completion steer
  *
  * Costs real (cheap) model tokens. Skips when herdr/tmux/auth are missing.
@@ -65,7 +65,7 @@ name: test-wait
 description: Integration test agent — does the task, then waits for the user
 tools: read, bash
 spawning: false
-auto-exit: false
+interactive: true
 disable-model-invocation: true
 ---
 
@@ -220,7 +220,7 @@ describe(
 
     // ── interactive child that calls subagent_done itself ──
 
-    it("non-auto-exit child calling subagent_done delivers a completion steer", async () => {
+    it("interactive child calling subagent_done delivers a completion steer", async () => {
       const id = uniqueId();
       const marker = join(ts.tmpDir, `inter-${id}.txt`);
 

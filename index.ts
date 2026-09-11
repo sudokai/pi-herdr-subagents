@@ -30,7 +30,12 @@ import {
   getAgentConfigDir,
   loadAgentDefaults,
 } from "./src/agents.ts";
-import { createHerdrClient, type HerdrClient } from "./src/herdr/client.ts";
+import {
+  createHerdrClient,
+  HERDR_PLUGIN_ID,
+  MIN_HERDR_VERSION,
+  type HerdrClient,
+} from "./src/herdr/client.ts";
 import { createHerdrEventStream } from "./src/herdr/events.ts";
 import { consumeContextUsageSidecar, contextUsagePath } from "./src/context-usage.ts";
 import {
@@ -50,7 +55,12 @@ import {
   renderSubagentPing,
   renderSubagentResult,
 } from "./src/messages.ts";
-import { findLastAssistantMessage, getNewEntries, seedSubagentSessionFile } from "./src/session.ts";
+import {
+  findLastAssistantMessage,
+  getNewEntries,
+  getSessionId,
+  seedSubagentSessionFile,
+} from "./src/session.ts";
 import {
   watchSubagent,
   type RunningSubagent,
@@ -59,6 +69,7 @@ import {
 } from "./src/watcher.ts";
 /** Absolute path of this module — used to detect losing the tool-registry race. */
 const MODULE_PATH = fileURLToPath(import.meta.url);
+const HERDR_PLUGIN_DIR = join(dirname(MODULE_PATH), "herdr-plugin");
 
 export interface BaseSpawnParams {
   name: string;
@@ -142,6 +153,62 @@ function defaultDeps(): RuntimeDeps {
 }
 
 let deps: RuntimeDeps = defaultDeps();
+let capabilityCheck: Promise<string | null> | null = null;
+
+function versionAtLeast(actual: string, minimum: string): boolean {
+  const parse = (value: string): number[] | null => {
+    const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(value.trim());
+    return match ? match.slice(1).map(Number) : null;
+  };
+  const actualParts = parse(actual);
+  const minimumParts = parse(minimum);
+  if (!actualParts || !minimumParts) return false;
+  for (let i = 0; i < 3; i += 1) {
+    if (actualParts[i] !== minimumParts[i]) return actualParts[i] > minimumParts[i];
+  }
+  return true;
+}
+
+async function checkHerdrCapability(): Promise<string | null> {
+  const status = await deps.client.ping();
+  if (!status.ok) {
+    return (
+      "the herdr server is not reachable from this pane. " +
+      "Is the herdr session still running?"
+    );
+  }
+  if (!status.version || !versionAtLeast(status.version, MIN_HERDR_VERSION)) {
+    return (
+      `herdr >= ${MIN_HERDR_VERSION} is required for plugin split panes ` +
+      `(found ${status.version ?? "unknown"}). Update herdr, then restart its session.`
+    );
+  }
+
+  const plugin = await deps.client.pluginGet(HERDR_PLUGIN_ID);
+  if (!plugin) {
+    return (
+      `the Herdr plugin is not linked. Run: herdr plugin link "${HERDR_PLUGIN_DIR}" --enabled`
+    );
+  }
+  if (!plugin.enabled) {
+    return `the Herdr plugin is disabled. Run: herdr plugin enable ${HERDR_PLUGIN_ID}`;
+  }
+  return null;
+}
+
+async function ensureHerdrCapability(): Promise<string | null> {
+  const check = capabilityCheck ??= checkHerdrCapability();
+  try {
+    const message = await check;
+    // Allow an in-place setup fix (link/enable/update) to be detected by the
+    // next attempt without requiring a pi reload. Successful checks stay cached.
+    if (message && capabilityCheck === check) capabilityCheck = null;
+    return message;
+  } catch (error) {
+    if (capabilityCheck === check) capabilityCheck = null;
+    throw error;
+  }
+}
 
 /**
  * One shared HerdrEventStream per pi process (PLAN.md Key Decision #8),
@@ -364,7 +431,7 @@ function armWatcher(
       const message = buildOutcomeMessage(
         running,
         mapOutcome ? mapOutcome(outcome) : outcome,
-        { contextUsage },
+        { contextUsage, sessionId: getSessionId(running.sessionFile) },
       );
       if (message) pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
     })
@@ -470,10 +537,11 @@ const SUBAGENT_DESCRIPTION_BASE =
 // ── setup-hint stubs (outside herdr, no other subagent provider) ────────────
 
 const SETUP_HINT =
-  "Subagents require pi to run inside a herdr pane (https://github.com/ogulcancelik/herdr). " +
-  "Start herdr in your terminal, open a pane, and run pi there — herdr injects HERDR_ENV, " +
-  "HERDR_PANE_ID, and HERDR_SOCKET_PATH into every pane, which this extension needs to " +
-  "launch and observe subagents. Install herdr ≥ 0.7.5 and restart pi inside it.";
+  `Subagents require herdr >= ${MIN_HERDR_VERSION} and the bundled Herdr plugin. ` +
+  `Link it with: herdr plugin link "${HERDR_PLUGIN_DIR}" --enabled; ` +
+  `then run: herdr plugin enable ${HERDR_PLUGIN_ID}. ` +
+  "Start herdr, open a pane, and run pi there — herdr injects HERDR_ENV, HERDR_PANE_ID, " +
+  "and HERDR_SOCKET_PATH, which this extension needs to launch and observe subagents.";
 
 const SPAWN_TOOL_NAMES = ["subagent", "subagent_resume", "subagent_interrupt", "subagents_list"];
 
@@ -575,6 +643,19 @@ async function executeSubagentSpawn(
     );
   }
 
+  let setupError: string | null;
+  try {
+    setupError = await ensureHerdrCapability();
+  } catch (error: any) {
+    setupError = `capability check failed: ${error?.message ?? String(error)}`;
+  }
+  if (setupError) {
+    return errorResult(
+      `Cannot start subagent: ${setupError}`,
+      "herdr setup incomplete",
+    );
+  }
+
   let launchParams: BaseSpawnParams & Record<string, unknown> = params;
   const expansionKeys = opts.expansionParamKeys ?? ["model", "thinking"];
   const needsExpansion =
@@ -626,14 +707,16 @@ async function executeSubagentSpawn(
   let started;
   try {
     started = await startSubagentPaneWithLayout(
-      plan.agentStart,
+      plan.paneStart,
       runningSubagents.values(),
-      (payload) => deps.client.agentStart(payload),
+      (payload) => deps.client.paneStart(payload),
     );
   } catch (error: any) {
     const message = error?.message ?? String(error);
     return errorResult(`Failed to start herdr pane for "${params.name}": ${message}`, message);
   }
+  // Best-effort sidebar label; the pane is already running the subagent.
+  await deps.client.paneRename(started.paneId, params.name).catch(() => {});
 
   const running: RunningSubagent = {
     id: plan.id,
@@ -830,6 +913,19 @@ async function executeSubagentResume(
     );
   }
 
+  let setupError: string | null;
+  try {
+    setupError = await ensureHerdrCapability();
+  } catch (error: any) {
+    setupError = `capability check failed: ${error?.message ?? String(error)}`;
+  }
+  if (setupError) {
+    return errorResult(
+      `Cannot resume subagent: ${setupError}`,
+      "herdr setup incomplete",
+    );
+  }
+
   // Record entry count before resuming so we can extract only new messages.
   const entryCountBefore = safeGetNewEntries(params.sessionPath, 0).length;
 
@@ -858,14 +954,16 @@ async function executeSubagentResume(
   let started;
   try {
     started = await startSubagentPaneWithLayout(
-      plan.agentStart,
+      plan.paneStart,
       runningSubagents.values(),
-      (payload) => deps.client.agentStart(payload),
+      (payload) => deps.client.paneStart(payload),
     );
   } catch (error: any) {
     const message = error?.message ?? String(error);
     return errorResult(`Failed to start herdr pane for "${plan.name}": ${message}`, message);
   }
+  // Best-effort sidebar label; the pane is already running the subagent.
+  await deps.client.paneRename(started.paneId, plan.name).catch(() => {});
 
   const running: RunningSubagent = {
     id: plan.id,
@@ -1311,21 +1409,19 @@ export function createHerdrSubagentsExtension(
       }
     }
 
-    // Socket reachability check (async; visible notify on failure).
-    void deps.client
-      .ping()
-      .then((res) => {
-        if (!res.ok) {
-          ctx.ui.notify(
-            "pi-herdr-subagents: the herdr server is not reachable from this pane — " +
-              "subagent spawns will fail. Is the herdr session still running?",
-            "warning",
-          );
+    // Cheap, asynchronous readiness check. Import stays side-effect free; tool
+    // execution awaits the same promise so setup failures stop before artifacts
+    // or panes are created.
+    capabilityCheck = null;
+    void ensureHerdrCapability()
+      .then((message) => {
+        if (message) {
+          ctx.ui.notify(`pi-herdr-subagents: ${message}`, "warning");
         }
       })
       .catch((error: any) => {
         ctx.ui.notify(
-          `pi-herdr-subagents: herdr ping failed: ${error?.message ?? String(error)}`,
+          `pi-herdr-subagents: capability check failed: ${error?.message ?? String(error)}`,
           "warning",
         );
       });
@@ -1376,6 +1472,7 @@ export const __test__ = {
   },
   reset(): void {
     deps = defaultDeps();
+    capabilityCheck = null;
     for (const running of runningSubagents.values()) {
       running.abortController?.abort();
     }

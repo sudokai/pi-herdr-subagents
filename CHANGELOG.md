@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Integrated from upstream (`modem-dev/pi-herdr-subagents` @ `b698732`)
+
+- **Plugin pane launch**: subagent panes now open through the bundled Herdr plugin
+  (`herdr plugin pane open --plugin pi-herdr-subagents --entrypoint subagent …`) instead of the
+  fork's `pane split` + `pane run`. Requires **herdr ≥ 0.8.2** and a one-time
+  `herdr plugin link …/herdr-plugin --enabled`. The extension validates the herdr version and
+  plugin state before spawning and returns an actionable setup error when either is missing.
+- Resume identifies a session by UUID (`pi --session <uuid>`) and the result widget shows the
+  session path; launch failures and crashes include the captured pane tail, with a failed
+  capture distinguished from a genuinely empty pane.
+- The `.exitcode` sidecar is stamped with the run id so a previous run's late write cannot be
+  mistaken for the current one.
+- Added the generic argv pane contract (`--entrypoint argv`) for non-subagent consumers.
+
+The fork's features are retained on top of the upstream ones: the
+`createHerdrSubagentsExtension(opts)` hooks, serialized pane layout + BSP equalization, the
+recursion guard, and the `interactive` spawn semantics.
+
 ### Changed
 
 - **Recursion guard**: subagents can no longer create subagents. The `subagent` and

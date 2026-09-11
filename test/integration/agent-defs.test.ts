@@ -84,11 +84,11 @@ describe("agent-def compat spot check (ISC-5)", () => {
           assert.equal(defs.thinking, rawValue(fm, "thinking"), "thinking");
           assert.equal(defs.denyTools, rawValue(fm, "deny-tools"), "deny-tools");
 
-          const rawAutoExit = rawValue(fm, "auto-exit");
+          const rawInteractive = rawValue(fm, "interactive");
           assert.equal(
-            defs.autoExit,
-            rawAutoExit != null ? rawAutoExit === "true" : undefined,
-            "auto-exit",
+            defs.interactive,
+            rawInteractive != null ? rawInteractive === "true" : undefined,
+            "interactive",
           );
 
           const rawSessionMode = rawValue(fm, "session-mode");
@@ -174,7 +174,7 @@ describe("agent-def compat spot check (ISC-5)", () => {
       mkdirSync(join(project, ".pi", "agents"), { recursive: true });
       writeFileSync(
         join(project, ".pi", "agents", "override-probe.md"),
-        "---\nname: override-probe\nmodel: project/model\nauto-exit: true\n---\nProject body.\n",
+        "---\nname: override-probe\nmodel: project/model\ninteractive: true\n---\nProject body.\n",
         "utf8",
       );
       process.chdir(project);
@@ -182,7 +182,7 @@ describe("agent-def compat spot check (ISC-5)", () => {
       const defs = loadAgentDefaults("override-probe");
       assert.ok(defs);
       assert.equal(defs.model, "project/model", "project def must win");
-      assert.equal(defs.autoExit, true);
+      assert.equal(defs.interactive, true);
 
       const listed = discoverAgentDefinitions().find((agent) => agent.name === "override-probe");
       assert.ok(listed);

@@ -39,16 +39,17 @@ push-style lifecycle events aren't uniformly available). But that retrofit is a 
 refactor multiplied across every backend and both of its launch paths. Rather than carry that
 surface area, this extension targets herdr only and uses its native primitives directly:
 
-- **argv process launch** (`herdr agent start … -- bash <script>`): the child is started as a
-  direct process. No shell, no typing, no delays — **the launch race cannot happen, by
+- **argv-backed plugin pane launch** (`herdr plugin pane open … --entrypoint subagent --env
+  PI_HERDR_LAUNCH_SCRIPT=<script>`): Herdr starts a fixed dispatcher which `exec`s the generated
+  launch script. No interactive shell, typing, or delays — **the launch race cannot happen, by
   construction**. There is no verify/retry machinery because there is nothing to verify.
 - **Socket events** (`events.subscribe` → `pane.exited` / `pane.closed`): a child that dies is
   an observable event within milliseconds, not a screen that stopped changing.
 
 ## Requirements
 
-- **herdr ≥ 0.7.1** (protocol 14 — pinned; the extension pings the socket at session start and
-  warns if the server is unreachable)
+- **herdr ≥ 0.8.2**, the first known-good release with split plugin panes. The extension checks
+  the running version and plugin state at session start.
 - **pi running inside a herdr pane.** herdr injects `HERDR_ENV`, `HERDR_PANE_ID`, and
   `HERDR_SOCKET_PATH` into every pane; the extension activates only when they are present.
 - **pi children only.** Claude Code / codex subagents are an explicit non-goal — if you need
@@ -67,6 +68,16 @@ Install as a pi package (add to `~/.pi/agent/settings.json`):
   ]
 }
 ```
+
+Link and enable the bundled Herdr plugin from the same checkout:
+
+```bash
+herdr plugin link /path/to/pi-herdr-subagents/herdr-plugin --enabled
+herdr plugin enable pi-herdr-subagents
+```
+
+The manifest and dispatcher are versioned with the pi extension. The dispatcher is static; each
+spawn selects its generated launch script through a pane-local environment variable.
 
 Then start herdr in your terminal and run pi in a pane:
 
@@ -91,6 +102,47 @@ The command creates the target directory and copies only missing files. Existing
 symlinks are skipped, so customized definitions are never overwritten. The copies are not tied
 to the package after installation: later package updates will not replace them; run the command
 again only to install template filenames that are still missing.
+
+## Generic argv pane contract
+
+The bundled Herdr plugin also provides a generic launcher for non-subagent consumers. Its
+contract is:
+
+- plugin id: `pi-herdr-subagents`
+- entrypoint: `argv`
+- launch-script env var: `PI_HERDR_LAUNCH_SCRIPT`
+
+Point the env var at an absolute, readable script. For example, a launch script for another TUI
+could contain:
+
+```bash
+#!/usr/bin/env bash
+trap '' TSTP
+exec /absolute/path/to/hunk
+```
+
+Open it in a pane with:
+
+```bash
+herdr plugin pane open \
+  --plugin pi-herdr-subagents \
+  --entrypoint argv \
+  --placement split \
+  --target-pane "$HERDR_PANE_ID" \
+  --direction right \
+  --cwd "$PWD" \
+  --env "PI_HERDR_LAUNCH_SCRIPT=/absolute/path/to/launch-hunk.sh" \
+  --no-focus
+```
+
+The dispatcher runs **non-interactive, non-login bash**. Use absolute paths for binaries; shell
+rc files and direnv are not loaded unless the launch script does that work itself. That clean
+startup is intentional: it avoids typing a command into a pane whose interactive shell may
+still be running direnv initialization.
+
+Launch scripts should also `trap '' TSTP`. An argv-launched pane has no parent interactive shell
+from which to run `fg`, so Ctrl+Z would otherwise suspend the command and wedge the pane
+permanently.
 
 **Outside herdr** the extension registers nothing at load. At `session_start`, if no other
 extension provides a `subagent` tool, it registers setup-hint stubs that explain how to run pi
@@ -166,8 +218,10 @@ Set `PI_HERDR_DIRENV=0` or an explicit `PI_HERDR_LAUNCH_PREFIX` to override.
 
 Agent definitions in project-local `.pi/agents/*.md` or global `~/.pi/agent/agents/*.md` are read
 with the same frontmatter semantics as pi-interactive-subagents (name, description, tools,
-deny-tools, model, thinking, spawning, auto-exit, interactive, session-mode, systemPromptMode,
-…) — the same defs drive both extensions during the transition. The package templates are not a
+deny-tools, model, thinking, spawning, interactive, session-mode, systemPromptMode,
+…) — the same defs drive both extensions during the transition, with two divergences:
+`auto-exit` is ignored (use `interactive`, the inverse), and `session-mode: standalone` maps to
+`lineage-only`. The package templates are not a
 runtime fallback; `/subagents-init` explicitly copies them into one of these user-owned
 locations. A `subagent_done` / `caller_ping` child extension is loaded into every child for the
 completion handshake.
@@ -192,16 +246,16 @@ eternal "stalled" zombie** — every row below terminates the running entry with
 |---|---|
 | child called `subagent_done` | `completed` + summary (last assistant message) |
 | child called `caller_ping` | `subagent_ping` + the child's question + session path |
-| user drove the child and quit pi without `subagent_done` | distinct honest phrasing: *"closed by user, no subagent_done"* + last message + session path |
-| child exited nonzero within the startup window (e.g. bad `--model`) | `failed to launch (exit code N)` + pane id + launch script path; pane held open for post-mortem |
-| child crashed later | exit code + last message + session path (resumable) |
+| user drove the child and quit pi without `subagent_done` | normal completion phrasing: *"completed (session closed by user)"* + last message + session path |
+| child exited nonzero within the startup window (e.g. bad `--model`) | `failed to launch (exit code N)` + captured pane tail + pane id + launch script path; pane held open for post-mortem |
+| child crashed later | exit code + captured pane tail + last message + session path (resumable) |
 | pane killed externally (no sidecars) | honest failure steer + session path (resumable) |
 | pane vanished while the event stream was down | classified from on-disk sidecars, else *"ended while event stream was down"* |
 
 ## Differences vs pi-interactive-subagents
 
-- **No launch race, by construction.** argv launch replaces type-into-shell; the shell-ready
-  delay, launch verify/retry loop, and sentinel screen polling have no analog here.
+- **No launch race, by construction.** An argv-backed plugin dispatcher replaces type-into-shell;
+  the shell-ready delay, launch verify/retry loop, and sentinel screen polling have no analog here.
 - **Truthful crash/lifecycle steers.** `pane.exited` + exit-code sidecar give immediate, honest
   launch-failure and crash reporting (a bad `--model` used to produce a silent zombie).
 - **No stall-status machinery.** The `starting/active/waiting/stalled` state machine and
@@ -212,6 +266,10 @@ eternal "stalled" zombie** — every row below terminates the running entry with
   as exactly that, not as a generic completion.
 - **pi children only.** No Claude Code CLI path, no transcript-copy machinery.
 - **Panes auto-close** on clean exit (held open only for startup crashes).
+- **Serialized pane layout**: the first subagent splits right from the orchestrator and later
+  ones stack down from the most recent subagent pane, then the tab's BSP dividers are
+  equalized so every pane gets an even share. Concurrent launches are serialized so they get
+  distinct layout slots.
 - **herdr only.** No cmux/tmux/zellij/wezterm code paths.
 
 ## Debugging
@@ -253,8 +311,9 @@ Useful tricks:
 - **No stall detection** (yet): a child that is alive but spinning its wheels is not flagged;
   herdr's sidebar agent states are the current signal. Could be reintroduced on
   `pane.agent_status_changed`.
-- **Single-workspace topology**: children split into the orchestrator's tab
-  (`--tab $HERDR_TAB_ID --split right`); multi-workspace layouts are unexplored.
+- **Single-workspace topology**: children split beside the orchestrator pane and then stack
+  from the newest subagent pane (`--target-pane … --direction right|down`); multi-workspace
+  layouts are unexplored.
 - **Hybrid client**: request/response goes through the `herdr` CLI; only `events.subscribe`
   uses a raw socket connection. The all-socket design (and when to switch) is sketched in
   [`docs/full-socket-client.md`](docs/full-socket-client.md).
@@ -268,9 +327,9 @@ npm run test:integration  # real pi children in an isolated named herdr session
 ```
 
 The integration harness creates its own tmux session and named herdr session
-(`herdr-subagents-test-<pid>-…`), points `PI_CODING_AGENT_DIR` at a temp dir, and refuses to
-run against the default herdr socket — your live sessions and global pi config are never
-touched.
+(`herdr-subagents-test-<pid>-…`), gives both Herdr and pi private temporary config roots, links
+and enables the plugin only there, and refuses to run against the default herdr socket — your
+live sessions and global Herdr/pi config are never touched.
 
 ## License
 

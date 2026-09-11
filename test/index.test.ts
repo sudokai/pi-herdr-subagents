@@ -147,9 +147,10 @@ function makeFakeCtx(overrides?: {
 
 function makeFakeClient(overrides?: Partial<Record<string, Function>>) {
   return {
-    async agentStart() {
+    async paneStart() {
       return { paneId: "w1:p9", terminalId: "term1", workspaceId: "w1", tabId: "t1" };
     },
+    async paneRename() {},
     async paneGet() {
       return null;
     },
@@ -159,7 +160,10 @@ function makeFakeClient(overrides?: Partial<Record<string, Function>>) {
     async paneClose() {},
     async paneSendKeys() {},
     async ping() {
-      return { ok: true, version: "0.7.1", protocol: 14 };
+      return { ok: true, version: "0.8.2", protocol: 14 };
+    },
+    async pluginGet() {
+      return { plugin_id: "pi-herdr-subagents", enabled: true };
     },
     ...overrides,
   } as any;
@@ -321,7 +325,7 @@ describe("index: activation guard", () => {
     );
   });
 
-  it("inside herdr with unreachable socket → visible notify from session_start ping", async () => {
+  it("inside herdr with unreachable socket → visible notify from session_start check", async () => {
     envInsideHerdr();
     __test__.setDeps({
       client: makeFakeClient({
@@ -334,7 +338,55 @@ describe("index: activation guard", () => {
     fake.fire("session_start", {}, ctx);
 
     await waitFor(() => notifications.length > 0);
-    assert.match(notifications[0].message, /herdr/i);
+    assert.match(notifications[0].message, /not reachable/i);
+  });
+
+  it("inside herdr with an old version → actionable upgrade warning", async () => {
+    envInsideHerdr();
+    __test__.setDeps({
+      client: makeFakeClient({
+        ping: async () => ({ ok: true, version: "0.8.1", protocol: 14 }),
+      }),
+    });
+    const fake = createFakePi();
+    herdrSubagents(fake.api);
+    const { ctx, notifications } = makeFakeCtx();
+    fake.fire("session_start", {}, ctx);
+
+    await waitFor(() => notifications.length > 0);
+    assert.match(notifications[0].message, /herdr >= 0\.8\.2/);
+    assert.match(notifications[0].message, /update herdr/i);
+  });
+
+  it("inside herdr without the plugin → actionable link warning", async () => {
+    envInsideHerdr();
+    __test__.setDeps({
+      client: makeFakeClient({ pluginGet: async () => null }),
+    });
+    const fake = createFakePi();
+    herdrSubagents(fake.api);
+    const { ctx, notifications } = makeFakeCtx();
+    fake.fire("session_start", {}, ctx);
+
+    await waitFor(() => notifications.length > 0);
+    assert.match(notifications[0].message, /plugin link/);
+    assert.match(notifications[0].message, /herdr-plugin/);
+  });
+
+  it("inside herdr with a disabled plugin → actionable enable warning", async () => {
+    envInsideHerdr();
+    __test__.setDeps({
+      client: makeFakeClient({
+        pluginGet: async () => ({ plugin_id: "pi-herdr-subagents", enabled: false }),
+      }),
+    });
+    const fake = createFakePi();
+    herdrSubagents(fake.api);
+    const { ctx, notifications } = makeFakeCtx();
+    fake.fire("session_start", {}, ctx);
+
+    await waitFor(() => notifications.length > 0);
+    assert.match(notifications[0].message, /plugin enable pi-herdr-subagents/);
   });
 });
 
@@ -424,17 +476,44 @@ describe("index: subagent tool", () => {
     assert.equal(result.details.error, "no session file");
   });
 
-  it("spawn: writes plan files, starts herdr agent, returns fire-and-forget ack", async () => {
+  it("capability failure stops before pane launch", async () => {
+    const { tool } = registerAndGetTool();
+    const fx = makeSpawnFixture();
+    let paneStarted = false;
+    __test__.setDeps({
+      client: makeFakeClient({
+        ping: async () => ({ ok: true, version: "0.8.1", protocol: 14 }),
+        paneStart: async () => {
+          paneStarted = true;
+          return { paneId: "w1:p9", terminalId: "", workspaceId: "", tabId: "" };
+        },
+      }),
+    });
+
+    const result = await tool.execute(
+      "t1",
+      { name: "Worker", task: "do it" },
+      undefined,
+      undefined,
+      fx.ctx,
+    );
+
+    assert.equal(result.details.error, "herdr setup incomplete");
+    assert.match(result.content[0].text, /herdr >= 0\.8\.2/);
+    assert.equal(paneStarted, false);
+  });
+
+  it("spawn: writes plan files, starts a plugin pane, returns fire-and-forget ack", async () => {
     const { tool } = registerAndGetTool();
     const fx = makeSpawnFixture();
 
-    const agentStartCalls: any[] = [];
+    const paneStartCalls: any[] = [];
     let watchedStream: unknown = null;
     const fakeStream = makeFakeStream();
     __test__.setDeps({
       client: makeFakeClient({
-        agentStart: async (p: any) => {
-          agentStartCalls.push(p);
+        paneStart: async (p: any) => {
+          paneStartCalls.push(p);
           return { paneId: "w1:p9", terminalId: "", workspaceId: "", tabId: "" };
         },
       }),
@@ -461,8 +540,8 @@ describe("index: subagent tool", () => {
     assert.match(result.content[0].text, /launched and is now running/);
 
     // argv launch through the client
-    assert.equal(agentStartCalls.length, 1);
-    assert.deepEqual(agentStartCalls[0].argv, ["bash", result.details.launchScriptFile]);
+    assert.equal(paneStartCalls.length, 1);
+    assert.equal(paneStartCalls[0].launchScriptFile, result.details.launchScriptFile);
 
     // watcher armed against the shared event stream
     await waitFor(() => watchedStream !== null);
@@ -577,13 +656,13 @@ describe("index: subagent tool", () => {
     assert.equal(fake.sent.length, 0);
   });
 
-  it("agentStart failure returns an error result and registers nothing", async () => {
+  it("paneStart failure returns an error result and registers nothing", async () => {
     const { fake, tool } = registerAndGetTool();
     const fx = makeSpawnFixture();
 
     __test__.setDeps({
       client: makeFakeClient({
-        agentStart: async () => {
+        paneStart: async () => {
           throw new Error("connection refused");
         },
       }),
