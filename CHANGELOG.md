@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- **Automatic bundled-plugin link on first interactive session.** When pi starts in `tui` mode
+  inside a herdr pane as the top-level session and the bundled plugin is not registered, the
+  extension now runs `herdr plugin link <package>/herdr-plugin --enabled` once and reports the
+  linked path with the `herdr plugin unlink pi-herdr-subagents` undo hint — no manual setup step.
+  The link is a no-op when the plugin is already linked from this checkout (paths are
+  canonicalized, so symlinks and `/tmp` → `/private/tmp` compare equal). A disabled plugin is
+  never enabled automatically, and a plugin linked from a different path is reported with both
+  paths instead of being overwritten. RPC/JSON/print sessions and subagent processes never
+  mutate the registry; a failed link falls back to the existing actionable spawn error.
+
 ### Integrated from upstream (`modem-dev/pi-herdr-subagents` @ `b698732`)
 
 - **Plugin pane launch**: subagent panes now open through the bundled Herdr plugin

@@ -156,6 +156,67 @@ describe("HerdrClient", () => {
     ]);
   });
 
+  it("pluginGet reports plugin_root and enabled state", async () => {
+    const { exec } = fakeExec([
+      {
+        stdout: JSON.stringify({
+          id: "cli:plugin",
+          result: {
+            type: "plugin_list",
+            plugins: [
+              {
+                plugin_id: "pi-herdr-subagents",
+                enabled: false,
+                plugin_root: "/opt/pi-herdr-subagents/herdr-plugin",
+                manifest_path: "/opt/pi-herdr-subagents/herdr-plugin/herdr-plugin.toml",
+                source: { kind: "local" },
+              },
+            ],
+          },
+        }),
+      },
+    ]);
+    const client = createHerdrClient({ exec });
+
+    const plugin = await client.pluginGet("pi-herdr-subagents");
+    assert.equal(plugin?.enabled, false);
+    assert.equal(plugin?.plugin_root, "/opt/pi-herdr-subagents/herdr-plugin");
+  });
+
+  it("pluginLink runs `herdr plugin link <path> --enabled` and demands exit 0", async () => {
+    const { exec, calls } = fakeExec([
+      { stdout: JSON.stringify({ id: "cli:plugin", result: { type: "plugin_linked" } }) },
+    ]);
+    const client = createHerdrClient({ exec });
+
+    await client.pluginLink("/opt/pi-herdr-subagents/herdr-plugin");
+
+    assert.deepEqual(calls[0].args, [
+      "plugin",
+      "link",
+      "/opt/pi-herdr-subagents/herdr-plugin",
+      "--enabled",
+    ]);
+  });
+
+  it("pluginLink surfaces a link failure envelope", async () => {
+    const { exec } = fakeExec([
+      {
+        stdout: JSON.stringify({
+          error: { code: "plugin_invalid", message: "plugin manifest is invalid" },
+          id: "cli:plugin",
+        }),
+        code: 1,
+      },
+    ]);
+    const client = createHerdrClient({ exec });
+
+    await assert.rejects(
+      () => client.pluginLink("/opt/broken-plugin"),
+      (err: Error) => err.message.includes("plugin manifest is invalid"),
+    );
+  });
+
   it("paneRename shells out to pane rename and only demands exit 0", async () => {
     const { exec, calls } = fakeExec([{ stdout: "" }]);
     const client = createHerdrClient({ exec });

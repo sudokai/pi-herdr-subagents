@@ -21,7 +21,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type, type TSchema } from "typebox";
-import { constants as fsConstants, copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { constants as fsConstants, copyFileSync, existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -35,6 +35,7 @@ import {
   HERDR_PLUGIN_ID,
   MIN_HERDR_VERSION,
   type HerdrClient,
+  type PluginInfo,
 } from "./src/herdr/client.ts";
 import { createHerdrEventStream } from "./src/herdr/events.ts";
 import { consumeContextUsageSidecar, contextUsagePath } from "./src/context-usage.ts";
@@ -153,7 +154,29 @@ function defaultDeps(): RuntimeDeps {
 }
 
 let deps: RuntimeDeps = defaultDeps();
-let capabilityCheck: Promise<string | null> | null = null;
+
+/**
+ * Registration state of the bundled Herdr plugin for the live herdr config.
+ * `message` is the actionable, user-facing explanation for every non-ready kind
+ * and is null exactly when `kind === "ready"`.
+ */
+type HerdrSetupStatus =
+  | { kind: "ready"; message: null }
+  | { kind: "server_unreachable"; message: string }
+  | { kind: "version_too_old"; message: string }
+  | { kind: "plugin_missing"; message: string }
+  | { kind: "plugin_disabled"; message: string }
+  | { kind: "plugin_conflict"; message: string; linkedRoot: string };
+
+/** Cached result of {@link classifyHerdrSetup}; non-ready results are not retained. */
+let capabilityCheck: Promise<HerdrSetupStatus> | null = null;
+
+/**
+ * In-flight automatic plugin link shared by concurrent session starts.
+ * Cleared when settled so later sessions check the current registry and retry
+ * failed links.
+ */
+let bundledPluginLinkAttempt: Promise<boolean> | null = null;
 
 function versionAtLeast(actual: string, minimum: string): boolean {
   const parse = (value: string): number[] | null => {
@@ -169,45 +192,166 @@ function versionAtLeast(actual: string, minimum: string): boolean {
   return true;
 }
 
-async function checkHerdrCapability(): Promise<string | null> {
-  const status = await deps.client.ping();
-  if (!status.ok) {
-    return (
-      "the herdr server is not reachable from this pane. " +
-      "Is the herdr session still running?"
-    );
-  }
-  if (!status.version || !versionAtLeast(status.version, MIN_HERDR_VERSION)) {
-    return (
-      `herdr >= ${MIN_HERDR_VERSION} is required for plugin split panes ` +
-      `(found ${status.version ?? "unknown"}). Update herdr, then restart its session.`
-    );
-  }
-
-  const plugin = await deps.client.pluginGet(HERDR_PLUGIN_ID);
-  if (!plugin) {
-    return (
-      `the Herdr plugin is not linked. Run: herdr plugin link "${HERDR_PLUGIN_DIR}" --enabled`
-    );
-  }
-  if (!plugin.enabled) {
-    return `the Herdr plugin is disabled. Run: herdr plugin enable ${HERDR_PLUGIN_ID}`;
-  }
-  return null;
-}
-
 async function ensureHerdrCapability(): Promise<string | null> {
-  const check = capabilityCheck ??= checkHerdrCapability();
+  // If a session-start link attempt is in flight, let it finish before
+  // classifying, so a spawn issued moments after startup sees the linked
+  // plugin instead of a stale "not linked" error.
+  if (bundledPluginLinkAttempt) await bundledPluginLinkAttempt;
+  const check = readHerdrSetupStatus();
   try {
-    const message = await check;
+    const status = await check;
     // Allow an in-place setup fix (link/enable/update) to be detected by the
     // next attempt without requiring a pi reload. Successful checks stay cached.
-    if (message && capabilityCheck === check) capabilityCheck = null;
-    return message;
+    if (status.kind !== "ready" && capabilityCheck === check) capabilityCheck = null;
+    return status.message;
   } catch (error) {
     if (capabilityCheck === check) capabilityCheck = null;
     throw error;
   }
+}
+
+/**
+ * Resolve a path to its canonical absolute form so two paths that reach the
+ * same directory compare equal (symlinks, and /tmp → /private/tmp on macOS).
+ * Uses the absolute lexical path if filesystem canonicalization fails.
+ */
+function canonicalizePath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+/** Canonical directory of the plugin bundled with this extension, computed once. */
+let bundledPluginDirCanonical: string | null = null;
+function bundledPluginDir(): string {
+  return (bundledPluginDirCanonical ??= canonicalizePath(HERDR_PLUGIN_DIR));
+}
+
+/** Directory a plugin registry entry points at, preferring `plugin_root`. */
+function registeredPluginRoot(plugin: PluginInfo): string | null {
+  if (typeof plugin.plugin_root === "string" && plugin.plugin_root) return plugin.plugin_root;
+  if (typeof plugin.manifest_path === "string" && plugin.manifest_path) {
+    return dirname(plugin.manifest_path);
+  }
+  return null;
+}
+
+/**
+ * Classify herdr readiness and bundled-plugin registration without mutating the
+ * registry. Distinguishes a missing plugin from a disabled one and from a
+ * different path already linked, so callers can link the first case and report
+ * the other two.
+ */
+async function classifyHerdrSetup(): Promise<HerdrSetupStatus> {
+  const status = await deps.client.ping();
+  if (!status.ok) {
+    return {
+      kind: "server_unreachable",
+      message:
+        "the herdr server is not reachable from this pane. " +
+        "Is the herdr session still running?",
+    };
+  }
+  if (!status.version || !versionAtLeast(status.version, MIN_HERDR_VERSION)) {
+    return {
+      kind: "version_too_old",
+      message:
+        `herdr >= ${MIN_HERDR_VERSION} is required for plugin split panes ` +
+        `(found ${status.version ?? "unknown"}). Update herdr, then restart its session.`,
+    };
+  }
+
+  const plugin = await deps.client.pluginGet(HERDR_PLUGIN_ID);
+  if (!plugin) {
+    return {
+      kind: "plugin_missing",
+      message: `the Herdr plugin is not linked. Run: herdr plugin link "${HERDR_PLUGIN_DIR}" --enabled`,
+    };
+  }
+  if (!plugin.enabled) {
+    return {
+      kind: "plugin_disabled",
+      message: `the Herdr plugin is disabled. Run: herdr plugin enable ${HERDR_PLUGIN_ID}`,
+    };
+  }
+
+  const linkedRoot = registeredPluginRoot(plugin);
+  if (linkedRoot && canonicalizePath(linkedRoot) !== bundledPluginDir()) {
+    return {
+      kind: "plugin_conflict",
+      linkedRoot,
+      message:
+        `the Herdr plugin "${HERDR_PLUGIN_ID}" is linked from a different path (${linkedRoot}), ` +
+        `not this install (${HERDR_PLUGIN_DIR}). Refusing to replace it. ` +
+        `To switch: herdr plugin unlink ${HERDR_PLUGIN_ID} && ` +
+        `herdr plugin link "${HERDR_PLUGIN_DIR}" --enabled`,
+    };
+  }
+  return { kind: "ready", message: null };
+}
+
+/** Read the capability check, reusing (or starting) the shared cached promise. */
+function readHerdrSetupStatus(): Promise<HerdrSetupStatus> {
+  return (capabilityCheck ??= classifyHerdrSetup());
+}
+
+/**
+ * Link the bundled plugin only when it is genuinely missing, then re-read the
+ * registry and report. Leaves other states for the caller to report.
+ * Returns true when it has notified the user about a link attempt, so the
+ * caller does not also emit the generic readiness warning.
+ */
+async function linkBundledPluginAndNotify(ctx: ExtensionContext): Promise<boolean> {
+  const before = await readHerdrSetupStatus();
+  if (before.kind !== "plugin_missing") return false;
+
+  try {
+    await deps.client.pluginLink(HERDR_PLUGIN_DIR);
+  } catch (error: any) {
+    // Re-read registration on the next check; a failed command may have
+    // changed registry state before exiting.
+    capabilityCheck = null;
+    ctx.ui.notify(
+      `pi-herdr-subagents: failed to link the bundled Herdr plugin (${HERDR_PLUGIN_DIR}): ` +
+        `${error?.message ?? String(error)}. Link it manually: ` +
+        `herdr plugin link "${HERDR_PLUGIN_DIR}" --enabled`,
+      "warning",
+    );
+    return true;
+  }
+
+  // A successful link only counts once the registry reports the plugin linked,
+  // enabled, and pointing at this install.
+  capabilityCheck = null;
+  const after = await readHerdrSetupStatus();
+  if (after.kind === "ready") {
+    ctx.ui.notify(
+      `pi-herdr-subagents: linked the bundled Herdr plugin from ${HERDR_PLUGIN_DIR}. ` +
+        `Undo with: herdr plugin unlink ${HERDR_PLUGIN_ID}`,
+      "info",
+    );
+  } else {
+    ctx.ui.notify(
+      `pi-herdr-subagents: linked the bundled Herdr plugin from ${HERDR_PLUGIN_DIR}, ` +
+        `but setup is still incomplete: ${after.message}`,
+      "warning",
+    );
+  }
+  return true;
+}
+
+/**
+ * Deduplicate automatic plugin linking only while an attempt is in flight.
+ * Classification errors propagate to the session-start notification boundary.
+ */
+function attemptBundledPluginLink(ctx: ExtensionContext): Promise<boolean> {
+  bundledPluginLinkAttempt ??= linkBundledPluginAndNotify(ctx)
+    .finally(() => {
+      bundledPluginLinkAttempt = null;
+    });
+  return bundledPluginLinkAttempt;
 }
 
 /**
@@ -1397,9 +1541,11 @@ export function createHerdrSubagentsExtension(
 
     // Inside herdr but lost the registry race (loaded after another provider):
     // warn visibly — never fail silently (PLAN.md Key Decision #3).
+    let lostRace = false;
     if (registeredRealTools && shouldRegister("subagent")) {
       const winner = pi.getAllTools().find((tool) => tool.name === "subagent");
       if (winner?.sourceInfo?.path && !isOwnSubagentProvider(winner.sourceInfo.path)) {
+        lostRace = true;
         ctx.ui.notify(
           `pi-herdr-subagents: another extension's "subagent" tool won the registry race ` +
             `(${winner.sourceInfo.path}). List pi-herdr-subagents BEFORE pi-interactive-subagents ` +
@@ -1411,20 +1557,25 @@ export function createHerdrSubagentsExtension(
 
     // Cheap, asynchronous readiness check. Import stays side-effect free; tool
     // execution awaits the same promise so setup failures stop before artifacts
-    // or panes are created.
+    // or panes are created. In an interactive parent session inside herdr, a
+    // missing plugin is linked automatically; disabled or
+    // differently-linked plugins are only reported.
     capabilityCheck = null;
-    void ensureHerdrCapability()
-      .then((message) => {
-        if (message) {
+    const canAutoLink = ctx.mode === "tui" && !isSubagentProcess() && !lostRace;
+    void (async () => {
+      try {
+        const linkHandled = canAutoLink && await attemptBundledPluginLink(ctx);
+        const message = await ensureHerdrCapability();
+        if (message && !linkHandled) {
           ctx.ui.notify(`pi-herdr-subagents: ${message}`, "warning");
         }
-      })
-      .catch((error: any) => {
+      } catch (error: any) {
         ctx.ui.notify(
           `pi-herdr-subagents: capability check failed: ${error?.message ?? String(error)}`,
           "warning",
         );
-      });
+      }
+    })();
   });
 
   pi.on("session_shutdown", () => {
@@ -1467,12 +1618,14 @@ export const __test__ = {
   startSubagentPaneWithLayout,
   collectEqualSplitTargets,
   __paneLayoutTest__,
+  herdrPluginDir: HERDR_PLUGIN_DIR,
   setDeps(overrides: Partial<RuntimeDeps>): void {
     deps = { ...deps, ...overrides };
   },
   reset(): void {
     deps = defaultDeps();
     capabilityCheck = null;
+    bundledPluginLinkAttempt = null;
     for (const running of runningSubagents.values()) {
       running.abortController?.abort();
     }

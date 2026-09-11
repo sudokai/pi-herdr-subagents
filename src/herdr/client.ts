@@ -38,9 +38,14 @@ export interface PingResult {
   protocol?: number | null;
 }
 
+/** One entry from `herdr plugin list --json` (local links report `source.kind: "local"`). */
 export interface PluginInfo {
   plugin_id: string;
   enabled: boolean;
+  /** Directory herdr registered for the plugin; canonicalized by herdr itself. */
+  plugin_root?: string;
+  manifest_path?: string;
+  source?: { kind?: string; [key: string]: unknown };
   [key: string]: unknown;
 }
 
@@ -71,6 +76,12 @@ export interface HerdrClient {
   paneSendKeys(paneId: string, keys: string[]): Promise<void>;
   ping(): Promise<PingResult>;
   pluginGet(pluginId: string): Promise<PluginInfo | null>;
+  /**
+   * Register the plugin at `pluginPath` and enable it in one step
+   * (`herdr plugin link <path> --enabled`). An existing registry entry for the
+   * same plugin id is replaced without a separate unlink.
+   */
+  pluginLink(pluginPath: string): Promise<void>;
 }
 
 interface HerdrJsonEnvelope {
@@ -298,6 +309,12 @@ export function createHerdrClient(opts?: { exec?: ExecFn; bin?: string }): Herdr
         "--json",
       ]);
       return result.plugins?.find((plugin) => plugin.plugin_id === pluginId) ?? null;
+    },
+
+    async pluginLink(pluginPath) {
+      // Success prints a plugin_linked envelope and exits 0; failures surface
+      // through the shared error-envelope path.
+      await execHerdr(["plugin", "link", pluginPath, "--enabled"]);
     },
   };
 }

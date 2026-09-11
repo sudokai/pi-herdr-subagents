@@ -1,11 +1,12 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import herdrSubagents, { __test__, createHerdrSubagentsExtension } from "../index.ts";
+import { HERDR_PLUGIN_ID } from "../src/herdr/client.ts";
 import type { SubagentOutcome } from "../src/watcher.ts";
 
 const INDEX_PATH = resolve(dirname(fileURLToPath(import.meta.url)), "..", "index.ts");
@@ -124,9 +125,11 @@ function makeFakeCtx(overrides?: {
   sessionFile?: string | null;
   sessionDir?: string;
   sessionId?: string;
+  mode?: "tui" | "rpc" | "json" | "print";
 }) {
   const notifications: Array<{ message: string; type: string }> = [];
   const ctx = {
+    mode: overrides?.mode ?? "tui",
     hasUI: false,
     cwd: overrides?.cwd ?? "/tmp",
     ui: {
@@ -165,6 +168,7 @@ function makeFakeClient(overrides?: Partial<Record<string, Function>>) {
     async pluginGet() {
       return { plugin_id: "pi-herdr-subagents", enabled: true };
     },
+    async pluginLink() {},
     ...overrides,
   } as any;
 }
@@ -358,21 +362,6 @@ describe("index: activation guard", () => {
     assert.match(notifications[0].message, /update herdr/i);
   });
 
-  it("inside herdr without the plugin → actionable link warning", async () => {
-    envInsideHerdr();
-    __test__.setDeps({
-      client: makeFakeClient({ pluginGet: async () => null }),
-    });
-    const fake = createFakePi();
-    herdrSubagents(fake.api);
-    const { ctx, notifications } = makeFakeCtx();
-    fake.fire("session_start", {}, ctx);
-
-    await waitFor(() => notifications.length > 0);
-    assert.match(notifications[0].message, /plugin link/);
-    assert.match(notifications[0].message, /herdr-plugin/);
-  });
-
   it("inside herdr with a disabled plugin → actionable enable warning", async () => {
     envInsideHerdr();
     __test__.setDeps({
@@ -387,6 +376,327 @@ describe("index: activation guard", () => {
 
     await waitFor(() => notifications.length > 0);
     assert.match(notifications[0].message, /plugin enable pi-herdr-subagents/);
+  });
+});
+
+// ── bundled plugin auto-link ────────────────────────────────────────────────
+
+/**
+ * Fake client with a mutable plugin registry: `pluginGet` reads it and
+ * `pluginLink` writes it (or throws), recording every link call.
+ */
+function makeLinkStateClient(opts: {
+  initial: Record<string, unknown> | null;
+  linkFails?: Error;
+}) {
+  let plugin = opts.initial;
+  const linkCalls: string[] = [];
+  const client = makeFakeClient({
+    pluginGet: async () => plugin,
+    pluginLink: async (path: string) => {
+      linkCalls.push(path);
+      if (opts.linkFails) throw opts.linkFails;
+      plugin = { plugin_id: HERDR_PLUGIN_ID, enabled: true, plugin_root: path };
+    },
+  });
+  return { client, linkCalls };
+}
+
+describe("index: bundled plugin auto-link", () => {
+  function fireSessionStart(client: unknown, mode: "tui" | "rpc" | "json" | "print" = "tui") {
+    __test__.setDeps({ client: client as any });
+    const fake = createFakePi();
+    herdrSubagents(fake.api);
+    const { ctx, notifications } = makeFakeCtx({ mode });
+    fake.fire("session_start", {}, ctx);
+    return { fake, ctx, notifications };
+  }
+
+  it("tui parent: a missing plugin is linked once, reported, and the check cache is cleared", async () => {
+    envInsideHerdr();
+    const { client, linkCalls } = makeLinkStateClient({ initial: null });
+    const { notifications } = fireSessionStart(client);
+
+    await waitFor(() => notifications.some((n) => n.type === "info"));
+    assert.deepEqual(linkCalls, [__test__.herdrPluginDir]);
+    const info = notifications.find((n) => n.type === "info")!;
+    assert.match(info.message, /linked the bundled Herdr plugin/);
+    assert.ok(info.message.includes(__test__.herdrPluginDir));
+    assert.match(info.message, /herdr plugin unlink pi-herdr-subagents/);
+    // The post-link readiness check must not report the stale missing plugin.
+    assert.deepEqual(
+      notifications.filter((n) => n.type === "warning"),
+      [],
+    );
+  });
+
+  it("tui parent: an existing correct link is a no-op", async () => {
+    envInsideHerdr();
+    const { client, linkCalls } = makeLinkStateClient({
+      initial: { plugin_id: HERDR_PLUGIN_ID, enabled: true, plugin_root: __test__.herdrPluginDir },
+    });
+    const { notifications } = fireSessionStart(client);
+
+    // Give the asynchronous readiness check time to finish; a correct link
+    // produces neither a link call nor a notification.
+    await new Promise((r) => setTimeout(r, 50));
+    assert.deepEqual(linkCalls, []);
+    assert.deepEqual(notifications, []);
+  });
+
+  it("tui parent: a correct link reached through a symlink is still a no-op", async (t) => {
+    envInsideHerdr();
+    const root = mkdtempSync(join(tmpdir(), "herdr-autolink-symlink-"));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const linkPath = join(root, "herdr-plugin");
+    try {
+      symlinkSync(__test__.herdrPluginDir, linkPath);
+    } catch {
+      t.skip("symlinks unavailable on this platform");
+      return;
+    }
+    const { client, linkCalls } = makeLinkStateClient({
+      initial: { plugin_id: HERDR_PLUGIN_ID, enabled: true, plugin_root: linkPath },
+    });
+    const { notifications } = fireSessionStart(client);
+
+    await new Promise((r) => setTimeout(r, 50));
+    assert.deepEqual(linkCalls, []);
+    assert.deepEqual(notifications, []);
+  });
+
+  it("tui parent: a disabled plugin is never enabled automatically", async () => {
+    envInsideHerdr();
+    const { client, linkCalls } = makeLinkStateClient({
+      initial: { plugin_id: HERDR_PLUGIN_ID, enabled: false, plugin_root: __test__.herdrPluginDir },
+    });
+    const { notifications } = fireSessionStart(client);
+
+    await waitFor(() => notifications.some((n) => n.type === "warning"));
+    assert.deepEqual(linkCalls, []);
+    assert.match(notifications[0].message, /plugin enable pi-herdr-subagents/);
+  });
+
+  it("tui parent: a different linked path is reported, never overwritten", async () => {
+    envInsideHerdr();
+    const otherRoot = "/some/other/checkout/pi-herdr-subagents/herdr-plugin";
+    const { client, linkCalls } = makeLinkStateClient({
+      initial: { plugin_id: HERDR_PLUGIN_ID, enabled: true, plugin_root: otherRoot },
+    });
+    const { notifications } = fireSessionStart(client);
+
+    await waitFor(() => notifications.some((n) => n.type === "warning"));
+    assert.deepEqual(linkCalls, []);
+    const warning = notifications.find((n) => n.type === "warning")!;
+    assert.match(warning.message, /linked from a different path/);
+    assert.match(warning.message, /Refusing to replace it/);
+    assert.ok(warning.message.includes(otherRoot));
+    assert.ok(warning.message.includes(__test__.herdrPluginDir));
+  });
+
+  it("tui parent: a failed link warns with the error and the manual command", async () => {
+    envInsideHerdr();
+    const { client, linkCalls } = makeLinkStateClient({
+      initial: null,
+      linkFails: new Error("plugin manifest is invalid"),
+    });
+    const { notifications } = fireSessionStart(client);
+
+    await waitFor(() => notifications.some((n) => n.type === "warning"));
+    assert.deepEqual(linkCalls, [__test__.herdrPluginDir]);
+    const warning = notifications.find((n) => n.type === "warning")!;
+    assert.match(warning.message, /failed to link the bundled Herdr plugin/);
+    assert.match(warning.message, /plugin manifest is invalid/);
+    assert.match(warning.message, /herdr plugin link/);
+    assert.deepEqual(
+      notifications.filter((n) => n.type === "info"),
+      [],
+    );
+  });
+
+  it("retries a failed link on the next session start", async () => {
+    envInsideHerdr();
+    const options = { initial: null, linkFails: new Error("temporary link failure") as Error | undefined };
+    const { client, linkCalls } = makeLinkStateClient(options);
+    const { fake, notifications } = fireSessionStart(client);
+    await waitFor(() => notifications.some((n) => n.type === "warning"));
+
+    options.linkFails = undefined;
+    const second = makeFakeCtx();
+    fake.fire("session_start", {}, second.ctx);
+    await waitFor(() => second.notifications.some((n) => n.type === "info"));
+    assert.equal(linkCalls.length, 2);
+    assert.deepEqual(second.notifications.filter((n) => n.type === "warning"), []);
+  });
+
+  it("reports a failed registry read and recovers on the next session start", async () => {
+    envInsideHerdr();
+    const { client, linkCalls } = makeLinkStateClient({ initial: null });
+    const readPlugin = client.pluginGet;
+    client.pluginGet = async () => { throw new Error("registry read failed"); };
+    const { fake, notifications } = fireSessionStart(client);
+    await waitFor(() => notifications.some((n) => n.type === "warning"));
+    assert.match(notifications[0].message, /capability check failed: registry read failed/);
+    assert.equal(linkCalls.length, 0);
+
+    client.pluginGet = readPlugin;
+    const second = makeFakeCtx();
+    fake.fire("session_start", {}, second.ctx);
+    await waitFor(() => second.notifications.some((n) => n.type === "info"));
+    assert.equal(linkCalls.length, 1);
+  });
+
+  for (const state of ["disabled", "conflict", "missing"] as const) {
+    it(`checks ${state} registration again after a successful link`, async () => {
+      envInsideHerdr();
+      const { client, linkCalls } = makeLinkStateClient({ initial: null });
+      const { fake, notifications } = fireSessionStart(client);
+      await waitFor(() => notifications.some((n) => n.type === "info"));
+
+      client.pluginGet = async () => state === "missing" ? null : {
+        plugin_id: HERDR_PLUGIN_ID,
+        enabled: state !== "disabled",
+        plugin_root: state === "conflict" ? "/other/herdr-plugin" : __test__.herdrPluginDir,
+      };
+      const second = makeFakeCtx();
+      fake.fire("session_start", {}, second.ctx);
+      await waitFor(() => second.notifications.some((n) => n.type === "warning"));
+      assert.equal(linkCalls.length, state === "missing" ? 2 : 1);
+      assert.match(second.notifications[0].message,
+        state === "disabled" ? /plugin is disabled/ :
+        state === "conflict" ? /different path/ : /setup is still incomplete/);
+    });
+  }
+
+  it("a spawn after a successful auto-link passes the capability gate", async () => {
+    envInsideHerdr();
+    const { client, linkCalls } = makeLinkStateClient({ initial: null });
+    const paneStartCalls: any[] = [];
+    __test__.setDeps({
+      client: {
+        ...client,
+        paneStart: async (p: any) => {
+          paneStartCalls.push(p);
+          return { paneId: "w1:p9", terminalId: "", workspaceId: "", tabId: "" };
+        },
+      } as any,
+      watch: async () => ({ kind: "completed", summary: "done", exitCode: 0 }),
+      createStream: () => makeFakeStream() as any,
+    });
+    const fake = createFakePi();
+    herdrSubagents(fake.api);
+    const tool = fake.findTool("subagent");
+    const fx = makeSpawnFixture();
+
+    fake.fire("session_start", {}, fx.ctx);
+    await waitFor(() => fx.notifications.some((n) => n.type === "info"));
+
+    const result = await tool.execute(
+      "t1",
+      { name: "Worker", task: "do it" },
+      undefined,
+      undefined,
+      fx.ctx,
+    );
+
+    assert.equal(result.details.status, "started", JSON.stringify(result.details));
+    assert.deepEqual(linkCalls, [__test__.herdrPluginDir]);
+    assert.equal(paneStartCalls.length, 1);
+  });
+
+  it("tui parent: concurrent session starts share one link attempt", async () => {
+    envInsideHerdr();
+    const { client, linkCalls } = makeLinkStateClient({ initial: null });
+    __test__.setDeps({ client: client as any });
+    const fake = createFakePi();
+    herdrSubagents(fake.api);
+    const first = makeFakeCtx();
+    const second = makeFakeCtx();
+
+    fake.fire("session_start", {}, first.ctx);
+    fake.fire("session_start", {}, second.ctx);
+
+    await waitFor(() =>
+      first.notifications.some((n) => n.type === "info") ||
+      second.notifications.some((n) => n.type === "info"),
+    );
+    await new Promise((r) => setTimeout(r, 30));
+    assert.deepEqual(linkCalls, [__test__.herdrPluginDir]);
+    assert.equal(
+      first.notifications.filter((n) => n.type === "info").length +
+        second.notifications.filter((n) => n.type === "info").length,
+      1,
+    );
+  });
+
+  it("tui parent: a later session leaves a correct registration untouched", async () => {
+    envInsideHerdr();
+    const { client, linkCalls } = makeLinkStateClient({ initial: null });
+    __test__.setDeps({ client: client as any });
+    const fake = createFakePi();
+    herdrSubagents(fake.api);
+    const first = makeFakeCtx();
+    fake.fire("session_start", {}, first.ctx);
+    await waitFor(() => first.notifications.some((n) => n.type === "info"));
+
+    const second = makeFakeCtx();
+    fake.fire("session_start", {}, second.ctx);
+    await new Promise((r) => setTimeout(r, 30));
+
+    assert.deepEqual(linkCalls, [__test__.herdrPluginDir]);
+    assert.deepEqual(second.notifications, []);
+  });
+
+  for (const mode of ["rpc", "json", "print"] as const) {
+    it(`mode ${mode}: never links implicitly, only warns`, async () => {
+      envInsideHerdr();
+      const { client, linkCalls } = makeLinkStateClient({ initial: null });
+      const { notifications } = fireSessionStart(client, mode);
+
+      await waitFor(() => notifications.some((n) => n.type === "warning"));
+      await new Promise((r) => setTimeout(r, 20));
+      assert.deepEqual(linkCalls, []);
+      assert.match(notifications[0].message, /plugin link/);
+    });
+  }
+
+  it("a subagent process never links the plugin", async () => {
+    envInsideHerdr();
+    process.env.PI_SUBAGENT_ID = "child-1";
+    const { client, linkCalls } = makeLinkStateClient({ initial: null });
+    const { notifications } = fireSessionStart(client);
+
+    await waitFor(() => notifications.some((n) => n.type === "warning"));
+    await new Promise((r) => setTimeout(r, 20));
+    assert.deepEqual(linkCalls, []);
+    assert.match(notifications[0].message, /plugin link/);
+  });
+
+  it("a session that lost the registry race does not link the plugin", async () => {
+    envInsideHerdr();
+    const { client, linkCalls } = makeLinkStateClient({ initial: null });
+    __test__.setDeps({ client: client as any });
+    const fake = createFakePi();
+    herdrSubagents(fake.api);
+    fake.setAllTools([
+      { name: "subagent", sourceInfo: { path: "/other/pi-interactive-subagents/index.ts" } },
+    ]);
+    const { ctx, notifications } = makeFakeCtx();
+    fake.fire("session_start", {}, ctx);
+
+    await waitFor(() => notifications.some((n) => /registry race/.test(n.message)));
+    await new Promise((r) => setTimeout(r, 20));
+    assert.deepEqual(linkCalls, []);
+  });
+
+  it("an unreachable server does not trigger a link attempt", async () => {
+    envInsideHerdr();
+    const { client, linkCalls } = makeLinkStateClient({ initial: null });
+    (client as any).ping = async () => ({ ok: false, version: null, protocol: null });
+    const { notifications } = fireSessionStart(client);
+
+    await waitFor(() => notifications.some((n) => /not reachable/i.test(n.message)));
+    assert.deepEqual(linkCalls, []);
   });
 });
 

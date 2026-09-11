@@ -69,12 +69,38 @@ Install as a pi package (add to `~/.pi/agent/settings.json`):
 }
 ```
 
-Link and enable the bundled Herdr plugin from the same checkout:
+That is the whole setup. The bundled Herdr plugin is linked **automatically**: the first time
+you start an interactive (`tui`) pi session in a herdr pane, if the plugin is not registered,
+the extension runs `herdr plugin link <package>/herdr-plugin --enabled` and reports the linked
+path. Later sessions recheck registration but leave a correct link untouched. Failed links
+are retried on the next eligible session start.
+
+The automatic link is deliberately narrow:
+
+- **Interactive, top-level sessions only.** RPC/JSON/print sessions and subagent processes
+  never mutate the registry; they keep the actionable spawn error instead.
+- **A missing plugin only.** A plugin you disabled stays disabled (with a warning telling you
+  to run `herdr plugin enable pi-herdr-subagents`), and a plugin already linked from a
+  different checkout is reported with both paths instead of being replaced.
+- **An already-correct link is a no-op.** An enabled link whose `plugin_root` resolves to this
+  package (symlinks and `/tmp` → `/private/tmp` included) is left untouched.
+
+To link by hand (or if the automatic link failed), run this from the same checkout:
 
 ```bash
 herdr plugin link /path/to/pi-herdr-subagents/herdr-plugin --enabled
-herdr plugin enable pi-herdr-subagents
 ```
+
+`herdr plugin link` replaces an existing registry entry for the same plugin id, so no
+`unlink` is needed first. To undo an automatic link:
+
+```bash
+herdr plugin unlink pi-herdr-subagents
+```
+
+An eligible session will register a missing plugin again. To keep the extension installed
+without automatic registration, disable the existing plugin with
+`herdr plugin disable pi-herdr-subagents` instead of unlinking it.
 
 The manifest and dispatcher are versioned with the pi extension. The dispatcher is static; each
 spawn selects its generated launch script through a pane-local environment variable.
@@ -300,6 +326,22 @@ Useful tricks:
   the exact child environment and invocation.
 - Every failure steer carries the child session path; `pi --session <path>` resumes it, or use
   `subagent_resume`.
+
+### Troubleshooting plugin setup
+
+| Symptom (session-start notice) | Cause | Fix |
+|---|---|---|
+| `the Herdr plugin is not linked` | Non-interactive session, subagent process, or a failed automatic link | Run `herdr plugin link /path/to/pi-herdr-subagents/herdr-plugin --enabled` in a terminal |
+| `failed to link the bundled Herdr plugin …` | `herdr plugin link` exited nonzero (bad manifest, permissions, unreachable server) | Read the quoted error, then link manually as above |
+| `the Herdr plugin is disabled` | The plugin is registered but you (or a config reset) disabled it | `herdr plugin enable pi-herdr-subagents` |
+| `linked from a different path` | Another checkout of this package owns the registry entry | Use that checkout, or `herdr plugin unlink pi-herdr-subagents` then link this one |
+| `herdr >= 0.8.2 is required` | Older herdr without split plugin panes | Update herdr, restart its session |
+| `the herdr server is not reachable` | Not inside a running herdr pane | Start herdr and run pi in a pane |
+
+**Uninstall caveat.** `herdr plugin link` registers executable plugin code in your *global*
+herdr config. That registration outlives removing the pi package or deleting the checkout, and
+it is intentionally never removed automatically. If you stop using this extension, run
+`herdr plugin unlink pi-herdr-subagents` yourself, or the registry keeps a stale path.
 
 ## Known limitations / upstream notes
 
