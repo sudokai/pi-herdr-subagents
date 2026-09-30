@@ -44,12 +44,12 @@ describe("subagent pane layout", () => {
     __paneLayoutTest__.resetSubagentPaneLayoutState();
     const launchOrder: Array<"right" | "down" | undefined> = [];
     await Promise.all([
-      startSubagentPaneWithLayout({ cwd: "/tmp" }, [], async (payload) => {
+      startSubagentPaneWithLayout({ direction: "right", cwd: "/tmp" }, [], async (payload) => {
         launchOrder.push(payload.direction);
         await new Promise((r) => setTimeout(r, 20));
         return { paneId: "pane-a" };
       }),
-      startSubagentPaneWithLayout({ cwd: "/tmp" }, [], async (payload) => {
+      startSubagentPaneWithLayout({ direction: "right", cwd: "/tmp" }, [], async (payload) => {
         launchOrder.push(payload.direction);
         return { paneId: "pane-b" };
       }),

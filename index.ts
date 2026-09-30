@@ -18,7 +18,7 @@
  * pi-extension/subagents/index.ts @ fix/launch-verify-retry, adapted for herdr
  * (argv launch via src/launch.ts + herdr client, no mux/screen-scrape code).
  */
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type, type TSchema } from "typebox";
 import { constants as fsConstants, copyFileSync, existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -68,6 +68,13 @@ import {
   type SubagentOutcome,
   type WatcherDeps,
 } from "./src/watcher.ts";
+import {
+  formatSubagentModelCatalog,
+  getAllowedSubagentModels,
+  getSubagentDelegationGuidance,
+  validateSubagentModelSelection,
+  type SubagentModelContext,
+} from "./src/model-selection.ts";
 /** Absolute path of this module — used to detect losing the tool-registry race. */
 const MODULE_PATH = fileURLToPath(import.meta.url);
 const HERDR_PLUGIN_DIR = join(dirname(MODULE_PATH), "herdr-plugin");
@@ -612,12 +619,12 @@ const ThinkingEnum = Type.Union(
   ],
   {
     description:
-      "Pi thinking level. Omit inherits parent. Primary per-child control: minimal/low for bounded work; medium for review; high+ for architecture or hard diagnosis.",
+      "Required explicit thinking level supported by the selected model. Use off for no extended reasoning; minimal/low for bounded work; medium for review; high+ for architecture or hard diagnosis.",
   },
 );
 
 const MODEL_FIELD_DESCRIPTION =
-  "Exact registered provider/model-id (split at first '/'). Omit inherits parent. No aliases, profiles, or fuzzy patterns.";
+  "Required exact provider/model ID from subagent_models (for example provider/model-id). No aliases, profiles, or fuzzy patterns.";
 
 function buildSubagentParams(extraSpawnParams: Record<string, TSchema> = {}) {
   return Type.Object({
@@ -632,8 +639,8 @@ function buildSubagentParams(extraSpawnParams: Record<string, TSchema> = {}) {
     systemPrompt: Type.Optional(
       Type.String({ description: "Appended to system prompt (role instructions)" }),
     ),
-    model: Type.Optional(Type.String({ description: `Model override. ${MODEL_FIELD_DESCRIPTION}` })),
-    thinking: Type.Optional(ThinkingEnum),
+    model: Type.String({ description: `Required model selection. ${MODEL_FIELD_DESCRIPTION}` }),
+    thinking: ThinkingEnum,
     skills: Type.Optional(
       Type.String({ description: "Comma-separated skills (overrides agent default)" }),
     ),
@@ -666,7 +673,7 @@ function buildSubagentParams(extraSpawnParams: Record<string, TSchema> = {}) {
 }
 
 const SUBAGENT_DESCRIPTION_BASE =
-  "Spawn a sub-agent in a dedicated herdr pane. " +
+  "Spawn a sub-agent in a dedicated herdr pane. Choose its exact model and thinking level from subagent_models first. Prefer the current provider by default, but use another listed provider when requested. " +
   "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
   "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
   "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
@@ -716,6 +723,29 @@ function errorResult(text: string, error: string) {
   };
 }
 
+/** Registers the on-demand catalog of models allowed for subagent spawns. */
+function registerSubagentModelsTool(pi: ExtensionAPI): void {
+  pi.registerTool({
+    name: "subagent_models",
+    label: "Subagent models",
+    description:
+      "List exact provider/model IDs allowed for subagent spawns, supported thinking levels, and pricing when available. The current provider is listed first as a soft preference.",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      const modelContext = ctx as unknown as SubagentModelContext & { model?: { provider: string } };
+      const models = getAllowedSubagentModels(modelContext, modelContext.model?.provider);
+      const preferredProvider = modelContext.model?.provider;
+      const preference = preferredProvider
+        ? `Current provider preference: ${preferredProvider}. This is a preference only; any listed provider is allowed.\n\n`
+        : "No current provider preference is available.\n\n";
+      return {
+        content: [{ type: "text", text: preference + formatSubagentModelCatalog(models) }],
+        details: { models: models.map(({ provider, id }) => ({ provider, id })) },
+      };
+    },
+  });
+}
+
 /**
  * True when this pi process is itself a subagent — i.e. it was started by
  * this extension's launch script and is running inside a herdr pane spawned
@@ -745,7 +775,7 @@ async function executeSubagentSpawn(
       getSessionId(): string;
       getSessionDir(): string;
     };
-  },
+  } & SubagentModelContext,
   opts: Pick<HerdrSubagentsOptions, "expandLaunchParams"> & { expansionParamKeys?: string[] },
 ) {
   // Subagents cannot create subagents — enforce the recursion guard first so
@@ -757,6 +787,16 @@ async function executeSubagentSpawn(
         "Complete the task directly and report back; spawning is reserved for the top-level session.",
       "recursive spawn blocked",
     );
+  }
+
+  const allowedModels = getAllowedSubagentModels(ctx, ctx.model?.provider);
+  const modelSelectionError = validateSubagentModelSelection(
+    allowedModels,
+    params.model,
+    params.thinking,
+  );
+  if (modelSelectionError) {
+    return errorResult(modelSelectionError, "invalid subagent model selection");
   }
 
   // Prevent self-spawning (e.g. planner spawning another planner)
@@ -824,6 +864,10 @@ async function executeSubagentSpawn(
         model: ctx.model,
         parentThinking: pi.getThinkingLevel(),
       });
+      // Explicit, validated tool selections take precedence over agent defaults
+      // and any legacy expansion hook defaults.
+      launchParams.model = params.model;
+      launchParams.thinking = params.thinking;
     } catch (error: any) {
       const message = error?.message ?? String(error);
       return errorResult(`Failed to expand subagent launch params: ${message}`, message);
@@ -970,7 +1014,8 @@ function registerSubagentTool(
         );
       }
 
-      const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+      const firstContent = result.content[0];
+      const text = firstContent?.type === "text" ? firstContent.text : "";
       return new Text(theme.fg("dim", text), 0, 0);
     },
   });
@@ -1190,7 +1235,8 @@ function registerResumeTool(pi: ExtensionAPI): void {
         );
       }
 
-      const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+      const firstContent = result.content[0];
+      const text = firstContent?.type === "text" ? firstContent.text : "";
       return new Text(theme.fg("dim", text), 0, 0);
     },
   });
@@ -1225,7 +1271,9 @@ export function resolveInterruptTarget(params: {
   return { error: `Ambiguous subagent name "${requestedName}". Matches: ${candidates}` };
 }
 
-async function handleSubagentInterrupt(params: { id?: string; name?: string }) {
+async function handleSubagentInterrupt(params: { id?: string; name?: string }): Promise<
+  AgentToolResult<{ error?: string; id?: string; name?: string; status?: string }>
+> {
   const resolved = resolveInterruptTarget(params);
   if ("error" in resolved) {
     return errorResult(resolved.error, resolved.error);
@@ -1298,7 +1346,8 @@ function registerInterruptTool(pi: ExtensionAPI): void {
         );
       }
 
-      const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+      const firstContent = result.content[0];
+      const text = firstContent?.type === "text" ? firstContent.text : "";
       return new Text(theme.fg("dim", text), 0, 0);
     },
   });
@@ -1520,13 +1569,34 @@ export function createHerdrSubagentsExtension(
 
   let registeredRealTools = false;
   if (inHerdr) {
-    if (shouldRegister("subagent")) registerSubagentTool(pi, subagentDescription, subagentParams, spawnOpts);
+    if (shouldRegister("subagent")) {
+      if (shouldRegister("subagent_models")) registerSubagentModelsTool(pi);
+      registerSubagentTool(pi, subagentDescription, subagentParams, spawnOpts);
+    }
     if (shouldRegister("subagent_resume")) registerResumeTool(pi);
     if (shouldRegister("subagent_interrupt")) registerInterruptTool(pi);
     if (shouldRegister("subagents_list")) registerListTool(pi);
     registerCommands(pi);
     registeredRealTools = true;
   }
+
+  pi.on("before_agent_start", (event, ctx) => {
+    if (!inHerdr || !shouldRegister("subagent")) return;
+    const preferredProvider = ctx.model?.provider;
+    const guidance =
+      "For every new subagent spawn, call `subagent_models` and pass its exact provider/model ID plus an explicit supported thinking level. " +
+      (preferredProvider
+        ? `Prefer the current provider (${preferredProvider}) by default; this preference is soft, and any catalog model is allowed when the user asks for another provider. `
+        : "Prefer the current provider shown by `subagent_models` when available; this preference is soft, and any catalog model is allowed when the user asks for another provider. ") +
+      "The current provider can change, so follow this guidance and the catalog for each spawn. " +
+      getSubagentDelegationGuidance(ctx.model);
+    const options = event.systemPromptOptions;
+    if ("sections" in options && options.sections && typeof options.sections === "object") {
+      (options.sections as Record<string, string>).subagent_model_selection = guidance;
+    } else {
+      (options.promptGuidelines ??= []).push(guidance);
+    }
+  });
 
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;

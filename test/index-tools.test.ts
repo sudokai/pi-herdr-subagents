@@ -59,7 +59,11 @@ function envInsideHerdr(): void {
 
 function createFakePi() {
   const registeredTools: any[] = [];
-  const commands: Array<{ name: string; handler: Function }> = [];
+  const commands: Array<{
+    name: string;
+    handler: Function;
+    getArgumentCompletions?: (prefix: string) => Array<{ value: string; label: string }> | null;
+  }> = [];
   const handlers = new Map<string, Function[]>();
   const sent: Array<{ message: any; options: any }> = [];
   const sentUser: string[] = [];
@@ -115,6 +119,10 @@ function makeFakeCtx(overrides?: { cwd?: string; sessionDir?: string }) {
   const ctx = {
     hasUI: false,
     cwd: overrides?.cwd ?? "/tmp",
+    model: { provider: "openai", id: "gpt-test" },
+    modelRegistry: {
+      getAvailable: () => [{ provider: "openai", id: "gpt-test", name: "GPT test", reasoning: true }],
+    },
     ui: {
       notify(message: string, type: string) {
         notifications.push({ message, type });
@@ -245,12 +253,95 @@ function registerAll() {
 // ── registration surface ────────────────────────────────────────────────────
 
 describe("index tools: registration", () => {
-  it("registers all four orchestrator tools inside herdr", () => {
+  it("registers the orchestrator tools inside herdr", () => {
     const fake = registerAll();
     const names = fake.registeredTools.map((t) => t.name);
-    for (const name of ["subagent", "subagent_resume", "subagent_interrupt", "subagents_list"]) {
+    for (const name of ["subagent", "subagent_models", "subagent_resume", "subagent_interrupt", "subagents_list"]) {
       assert.ok(names.includes(name), `expected ${name} to be registered`);
     }
+  });
+
+  it("lists exact scoped model IDs, capabilities, pricing, and a soft provider preference", async () => {
+    const fake = registerAll();
+    const catalog = fake.findTool("subagent_models");
+    assert.ok(catalog);
+    const ctx = makeFakeCtx().ctx as any;
+    ctx.model = { provider: "anthropic", id: "current" };
+    ctx.scopedModels = [
+      { provider: "openai", id: "o3", name: "O3", reasoning: true, cost: { input: 2, output: 8 } },
+      { provider: "anthropic", id: "claude", reasoning: false },
+    ];
+
+    const result = await catalog.execute("t1", {}, undefined, undefined, ctx);
+    assert.match(result.content[0].text, /Current provider preference: anthropic/);
+    assert.ok(result.content[0].text.indexOf("anthropic/claude") < result.content[0].text.indexOf("openai/o3"));
+    assert.match(result.content[0].text, /thinking: off/);
+    assert.match(result.content[0].text, /pricing \(USD per million tokens\): input=2, output=8/);
+    assert.equal(result.details.models.length, 2);
+  });
+
+  it("refreshes spawn guidance when the active provider changes", () => {
+    const fake = registerAll();
+    const event = { systemPromptOptions: { sections: {} as Record<string, string> } };
+    const ctx = makeFakeCtx().ctx as any;
+
+    ctx.model = { provider: "openai", id: "gpt-test" };
+    fake.fire("before_agent_start", event, ctx);
+    assert.match(event.systemPromptOptions.sections.subagent_model_selection, /Prefer the current provider \(openai\)/);
+
+    ctx.model = { provider: "anthropic", id: "claude-test" };
+    fake.fire("before_agent_start", event, ctx);
+    assert.match(event.systemPromptOptions.sections.subagent_model_selection, /Prefer the current provider \(anthropic\)/);
+  });
+
+  it("guides Sol delegation by task complexity and clears the rule after a model switch", () => {
+    const fake = registerAll();
+    const event = { systemPromptOptions: { sections: {} as Record<string, string> } };
+    const ctx = makeFakeCtx().ctx as any;
+    ctx.model = { provider: "openai-codex", id: "gpt-6.1-sol" };
+
+    fake.fire("before_agent_start", event, ctx);
+    const guidance = event.systemPromptOptions.sections.subagent_model_selection;
+    assert.match(guidance, /openai-codex\/gpt-6-luna.*only for well-scoped everyday tasks/);
+    assert.match(guidance, /complex work requiring careful judgment.*main agent.*openai-codex\/gpt-6.1-sol/);
+    assert.match(guidance, /If uncertain, do not delegate/);
+    assert.match(guidance, /outside the current scope.*main agent/);
+    assert.match(guidance, /Explicit user requests override.*not scope restrictions/);
+
+    ctx.model = { provider: "openai-codex", id: "gpt-5.5" };
+    fake.fire("before_agent_start", event, ctx);
+    assert.doesNotMatch(event.systemPromptOptions.sections.subagent_model_selection, /gpt-6-luna/);
+  });
+
+  it("gives Opus the same delegation guidance without applying it to other providers", () => {
+    const fake = registerAll();
+    const ctx = makeFakeCtx().ctx as any;
+    ctx.model = { provider: "anthropic", id: "claude-opus-5.5" };
+    const event = { systemPromptOptions: { promptGuidelines: [] as string[] } };
+
+    fake.fire("before_agent_start", event, ctx);
+    const guidance = event.systemPromptOptions.promptGuidelines.join("\n");
+    assert.match(guidance, /anthropic\/claude-sonnet-5.5.*only for well-scoped everyday tasks/);
+    assert.match(guidance, /complex work requiring careful judgment.*main agent.*anthropic\/claude-opus-5.5/);
+    assert.match(guidance, /If uncertain, do not delegate/);
+    assert.match(guidance, /outside the current scope.*main agent/);
+    assert.match(guidance, /Explicit user requests override.*not scope restrictions/);
+
+    ctx.model = { provider: "opencode", id: "claude-opus-5.5" };
+    const nextEvent = { systemPromptOptions: { promptGuidelines: [] as string[] } };
+    fake.fire("before_agent_start", nextEvent, ctx);
+    assert.doesNotMatch(nextEvent.systemPromptOptions.promptGuidelines.join("\n"), /claude-sonnet-5.5/);
+  });
+
+  it("adds provider guidance when Pi exposes prompt guidelines instead of sections", () => {
+    const fake = registerAll();
+    const event = { systemPromptOptions: { promptGuidelines: ["Keep existing guidance."] } };
+    const ctx = makeFakeCtx().ctx;
+
+    fake.fire("before_agent_start", event, ctx);
+
+    assert.equal(event.systemPromptOptions.promptGuidelines[0], "Keep existing guidance.");
+    assert.match(event.systemPromptOptions.promptGuidelines.join("\n"), /Prefer the current provider/);
   });
 
   it("registers /subagent and /iterate commands inside herdr", () => {
@@ -553,6 +644,8 @@ describe("index tools: polished widget", () => {
         name: "Count sheep with a long enough name to need truncation",
         task: "count sheep",
         agent: "scout",
+        model: "openai/gpt-test",
+        thinking: "off",
       },
       undefined,
       undefined,
@@ -718,6 +811,7 @@ describe("index tools: commands", () => {
   it("/subagents-init autocomplete has exact labels and prefix filtering", () => {
     const fake = registerAll();
     const complete = fake.findCommand("subagents-init")!.getArgumentCompletions;
+    assert.ok(complete);
     const expected = [
       {
         value: "global",
@@ -737,6 +831,28 @@ describe("index tools: commands", () => {
     assert.equal(complete("x"), null);
   });
 
+  it("rejects missing and out-of-scope model selections before launch", async () => {
+    const fake = registerAll();
+    const fx = makeFixture();
+    let launchCount = 0;
+    __test__.setDeps({
+      client: makeFakeClient({ paneStart: async () => { launchCount += 1; return { paneId: "p9", terminalId: "", workspaceId: "", tabId: "" }; } }),
+    });
+    const tool = fake.findTool("subagent");
+
+    const missing = await tool.execute("t1", { name: "Worker", task: "work" }, undefined, undefined, fx.ctx);
+    assert.match(missing.content[0].text, /exact provider\/model ID/);
+    const outOfScope = await tool.execute(
+      "t2",
+      { name: "Worker", task: "work", model: "anthropic/not-scoped", thinking: "off" },
+      undefined,
+      undefined,
+      fx.ctx,
+    );
+    assert.match(outOfScope.content[0].text, /not available in the current model scope/);
+    assert.equal(launchCount, 0);
+  });
+
   it("subagent tool rejects an explicitly named missing agent before launch", async () => {
     const fake = registerAll();
     const fx = makeFixture();
@@ -752,7 +868,7 @@ describe("index tools: commands", () => {
 
     const result = await fake.findTool("subagent").execute(
       "t1",
-      { name: "Missing", task: "do work", agent: "missing" },
+      { name: "Missing", task: "do work", agent: "missing", model: "openai/gpt-test", thinking: "off" },
       undefined,
       undefined,
       fx.ctx,
@@ -781,7 +897,7 @@ describe("index tools: commands", () => {
 
     const result = await fake.findTool("subagent").execute(
       "t1",
-      { name: "Generic", task: "do work" },
+      { name: "Generic", task: "do work", model: "openai/gpt-test", thinking: "off" },
       undefined,
       undefined,
       fx.ctx,

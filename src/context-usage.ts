@@ -52,15 +52,17 @@ function addUsageToBreakdown(totals: TokenBreakdown, usage: Usage): void {
 export function aggregateSessionTokenBreakdown(entries: readonly SessionEntry[]): TokenBreakdown {
   const totals: TokenBreakdown = { input: 0, cacheRead: 0, output: 0 };
   for (const entry of entries) {
-    if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
-      addUsageToBreakdown(totals, entry.usage);
+    const entryUsage = (entry as SessionEntry & { usage?: Usage }).usage;
+    if ((entry.type === "branch_summary" || entry.type === "compaction") && entryUsage) {
+      addUsageToBreakdown(totals, entryUsage);
       continue;
     }
     if (entry.type !== "message") continue;
 
     const message = entry.message;
-    if (message.role === "toolResult" && message.usage) {
-      addUsageToBreakdown(totals, message.usage);
+    const toolUsage = (message as typeof message & { usage?: Usage }).usage;
+    if (message.role === "toolResult" && toolUsage) {
+      addUsageToBreakdown(totals, toolUsage);
     } else if (message.role === "assistant") {
       addUsageToBreakdown(totals, message.usage);
     }

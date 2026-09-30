@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { __test__ } from "../index.ts";
+import type { LayoutNode } from "../src/herdr/layout-equalize.ts";
 
 const { collectEqualSplitTargets } = __test__;
 
@@ -9,9 +10,9 @@ const pane = (id: string) => ({ type: "pane" as const, pane_id: id });
 const split = (
   direction: "right" | "down",
   ratio: number,
-  first: ReturnType<typeof pane> | ReturnType<typeof split>,
-  second: ReturnType<typeof pane> | ReturnType<typeof split>,
-) => ({ type: "split" as const, direction, ratio, first, second });
+  first: LayoutNode,
+  second: LayoutNode,
+): LayoutNode => ({ type: "split" as const, direction, ratio, first, second });
 
 describe("layout equalize targets", () => {
   it("equalizes two stacked panes", () => {

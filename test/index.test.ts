@@ -132,6 +132,10 @@ function makeFakeCtx(overrides?: {
     mode: overrides?.mode ?? "tui",
     hasUI: false,
     cwd: overrides?.cwd ?? "/tmp",
+    model: { provider: "openai", id: "gpt-test" },
+    modelRegistry: {
+      getAvailable: () => [{ provider: "openai", id: "gpt-test", name: "GPT test", reasoning: true }],
+    },
     ui: {
       notify(message: string, type: string) {
         notifications.push({ message, type });
@@ -593,7 +597,7 @@ describe("index: bundled plugin auto-link", () => {
 
     const result = await tool.execute(
       "t1",
-      { name: "Worker", task: "do it" },
+      { name: "Worker", task: "do it", model: "openai/gpt-test", thinking: "off" },
       undefined,
       undefined,
       fx.ctx,
@@ -719,7 +723,7 @@ describe("index: subagent tool", () => {
 
     const result = await tool.execute(
       "t1",
-      { name: "Worker 2", task: "do it", agent: "worker" },
+      { name: "Worker 2", task: "do it", model: "openai/gpt-test", thinking: "off", agent: "worker" },
       undefined,
       undefined,
       ctx,
@@ -736,7 +740,7 @@ describe("index: subagent tool", () => {
 
     const result = await tool.execute(
       "t1",
-      { name: "Worker", task: "do it", agent: "worker" },
+      { name: "Worker", task: "do it", model: "openai/gpt-test", thinking: "off", agent: "worker" },
       undefined,
       undefined,
       ctx,
@@ -762,7 +766,7 @@ describe("index: subagent tool", () => {
 
     const result = await tool.execute(
       "t1",
-      { name: "Scout", task: "do it" },
+      { name: "Scout", task: "do it", model: "openai/gpt-test", thinking: "off" },
       undefined,
       undefined,
       fx.ctx,
@@ -777,7 +781,7 @@ describe("index: subagent tool", () => {
 
     const result = await tool.execute(
       "t1",
-      { name: "Worker", task: "do it" },
+      { name: "Worker", task: "do it", model: "openai/gpt-test", thinking: "off" },
       undefined,
       undefined,
       ctx,
@@ -802,7 +806,7 @@ describe("index: subagent tool", () => {
 
     const result = await tool.execute(
       "t1",
-      { name: "Worker", task: "do it" },
+      { name: "Worker", task: "do it", model: "openai/gpt-test", thinking: "off" },
       undefined,
       undefined,
       fx.ctx,
@@ -836,7 +840,7 @@ describe("index: subagent tool", () => {
 
     const result = await tool.execute(
       "t1",
-      { name: "Worker", task: "do it" },
+      { name: "Worker", task: "do it", model: "openai/gpt-test", thinking: "off" },
       undefined,
       undefined,
       fx.ctx,
@@ -886,7 +890,7 @@ describe("index: subagent tool", () => {
 
     const result = await tool.execute(
       "t1",
-      { name: "Worker", task: "do it" },
+      { name: "Worker", task: "do it", model: "openai/gpt-test", thinking: "off" },
       undefined,
       undefined,
       fx.ctx,
@@ -938,7 +942,7 @@ describe("index: subagent tool", () => {
       createStream: () => makeFakeStream() as any,
     });
 
-    await tool.execute("t1", { name: "Worker", task: "do it" }, undefined, undefined, fx.ctx);
+    await tool.execute("t1", { name: "Worker", task: "do it", model: "openai/gpt-test", thinking: "off" }, undefined, undefined, fx.ctx);
     await waitFor(() => fake.sent.length === 1);
 
     assert.doesNotMatch(fake.sent[0].message.content, /Context:/);
@@ -960,7 +964,7 @@ describe("index: subagent tool", () => {
       createStream: () => makeFakeStream() as any,
     });
 
-    await tool.execute("t1", { name: "Worker", task: "do it" }, undefined, undefined, fx.ctx);
+    await tool.execute("t1", { name: "Worker", task: "do it", model: "openai/gpt-test", thinking: "off" }, undefined, undefined, fx.ctx);
     await waitFor(() => watched && __test__.runningSubagents.size === 0);
     await new Promise((r) => setTimeout(r, 10));
     assert.equal(fake.sent.length, 0);
@@ -981,7 +985,7 @@ describe("index: subagent tool", () => {
 
     const result = await tool.execute(
       "t1",
-      { name: "Worker", task: "do it" },
+      { name: "Worker", task: "do it", model: "openai/gpt-test", thinking: "off" },
       undefined,
       undefined,
       fx.ctx,
@@ -1006,7 +1010,7 @@ describe("index: subagent tool", () => {
 
     const result = await tool.execute(
       "t1",
-      { name: "C", task: "x", agent: "claudey" },
+      { name: "C", task: "x", agent: "claudey", model: "openai/gpt-test", thinking: "off" },
       undefined,
       undefined,
       fx.ctx,

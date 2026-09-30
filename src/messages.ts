@@ -17,7 +17,7 @@
 //
 // Tool descriptions/promptSnippets are NOT here (Task 10) — outcome→message only.
 import { keyHint } from "@earendil-works/pi-coding-agent";
-import { Box, Text } from "@earendil-works/pi-tui";
+import { Box, Text, type Component } from "@earendil-works/pi-tui";
 
 import { formatContextUsageLine, type ContextUsageSnapshot } from "./context-usage.ts";
 import type { RunningSubagent, SubagentOutcome } from "./watcher.ts";
@@ -238,7 +238,7 @@ type Theme = {
   bold(text: string): string;
 };
 type RenderOptions = { expanded: boolean };
-type RenderedMessage = { render(width: number): string[] } | undefined;
+type RenderedMessage = Component | undefined;
 type SteerLike = { content?: unknown; details?: unknown };
 
 /** keyHint needs pi's initialized theme; fall back to plain text headless (unit tests). */
@@ -277,6 +277,7 @@ export function renderSubagentResult(
   if (!details) return undefined;
 
   return {
+    invalidate() {},
     render(width: number): string[] {
       const name = details.name ?? "subagent";
       const exitCode = typeof details.exitCode === "number" ? details.exitCode : 1;
@@ -362,6 +363,7 @@ export function renderSubagentPing(
   if (!details) return undefined;
 
   return {
+    invalidate() {},
     render(width: number): string[] {
       const name = details.name ?? "subagent";
       const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
