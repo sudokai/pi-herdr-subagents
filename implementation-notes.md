@@ -1,6 +1,7 @@
 # Implementation notes: explicit subagent model selection
 
 ## Decisions
+- **Unwrap Pi scoped model entries** — Pi exposes `{ model, thinkingLevel }` entries. Accept these alongside direct model entries, and use the registry only when the scope is empty.
 - **Use the active model scope when present; otherwise use authenticated registry models** — keeps explicit scope boundaries authoritative while using `ModelRegistry.getAvailable()` for the fallback catalog.
 - **Treat the current provider as a soft preference** — list it first and refresh guidance before each agent run, without excluding other allowed providers.
 

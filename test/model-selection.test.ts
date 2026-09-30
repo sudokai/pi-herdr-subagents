@@ -39,6 +39,15 @@ describe("subagent model selection", () => {
     assert.deepEqual(available.map(({ provider, id }) => `${provider}/${id}`), ["openai/o3", "anthropic/haiku"]);
   });
 
+  it("validates selections from Pi scoped entries and rejects models outside the scope", () => {
+    const models = getAllowedSubagentModels({
+      scopedModels: [{ model: reasoningModel, thinkingLevel: "high" }],
+      modelRegistry: { getAvailable: () => [textModel] },
+    });
+    assert.equal(validateSubagentModelSelection(models, "openai/o3", "high"), undefined);
+    assert.match(validateSubagentModelSelection(models, "anthropic/haiku", "off") ?? "", /not available/);
+  });
+
   it("shows thinking off for every model and reasoning levels only where supported", () => {
     assert.deepEqual(getSupportedThinkingLevels(textModel), ["off"]);
     assert.deepEqual(getSupportedThinkingLevels(reasoningModel), ["off", "minimal", "low", "medium", "high"]);

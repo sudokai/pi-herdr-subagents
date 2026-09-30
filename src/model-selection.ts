@@ -16,7 +16,7 @@ export interface SubagentModel {
 
 /** Model context needed to list and validate available subagent models. */
 export interface SubagentModelContext {
-  scopedModels?: SubagentModel[];
+  scopedModels?: readonly (SubagentModel | { model: SubagentModel; thinkingLevel?: string })[];
   modelRegistry?: {
     getAvailable?: () => SubagentModel[];
   };
@@ -54,7 +54,9 @@ export function getAllowedSubagentModels(
 ): SubagentModel[] {
   const scopedModels = Array.isArray(ctx.scopedModels) ? ctx.scopedModels : [];
   const models =
-    scopedModels.length > 0 ? scopedModels : (ctx.modelRegistry?.getAvailable?.() ?? []);
+    scopedModels.length > 0
+      ? scopedModels.map((entry) => ("model" in entry ? entry.model : entry))
+      : (ctx.modelRegistry?.getAvailable?.() ?? []);
   const uniqueModels = new Map<string, SubagentModel>();
   for (const model of models) {
     if (model && typeof model.provider === "string" && typeof model.id === "string") {

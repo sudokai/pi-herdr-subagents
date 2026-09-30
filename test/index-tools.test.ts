@@ -280,6 +280,21 @@ describe("index tools: registration", () => {
     assert.equal(result.details.models.length, 2);
   });
 
+  it("lists Pi scoped model entries without admitting models outside the scope", async () => {
+    const fake = registerAll();
+    const ctx = makeFakeCtx().ctx as any;
+    ctx.model = { provider: "openai-codex", id: "gpt-6.1-sol" };
+    ctx.scopedModels = [
+      { model: { ...ctx.model, reasoning: true }, thinkingLevel: "high" },
+    ];
+
+    const result = await fake.findTool("subagent_models").execute("t1", {}, undefined, undefined, ctx);
+    assert.match(result.content[0].text, /openai-codex\/gpt-6\.1-sol/);
+    assert.doesNotMatch(result.content[0].text, /No authenticated chat models/);
+    assert.deepEqual(result.details.models.map((model: { provider: string; id: string }) =>
+      `${model.provider}/${model.id}`), ["openai-codex/gpt-6.1-sol"]);
+  });
+
   it("refreshes spawn guidance when the active provider changes", () => {
     const fake = registerAll();
     const event = { systemPromptOptions: { sections: {} as Record<string, string> } };
