@@ -295,6 +295,32 @@ describe("index tools: registration", () => {
       `${model.provider}/${model.id}`), ["openai-codex/gpt-6.1-sol"]);
   });
 
+  it("caps subagent classes for every active model", () => {
+    const fake = registerAll();
+    const event = { systemPromptOptions: { sections: {} as Record<string, string> } };
+    const ctx = makeFakeCtx().ctx as any;
+    for (const id of ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "claude-fable", "claude-opus-5.5", "claude-sonnet-5.5"]) {
+      ctx.model = { provider: id.startsWith("claude") ? "anthropic" : "openai-codex", id };
+      fake.fire("before_agent_start", event, ctx);
+      const guidance = event.systemPromptOptions.sections.subagent_model_selection;
+      assert.match(guidance, /Never use a subagent above the main agent's model class/);
+      if (ctx.model.provider === "openai-codex") {
+        assert.match(guidance, /Astra > Sol > Luna/);
+        assert.doesNotMatch(guidance, /Fable > Opus > Sonnet/);
+      } else {
+        assert.match(guidance, /Fable > Opus > Sonnet/);
+        assert.doesNotMatch(guidance, /Astra > Sol > Luna/);
+      }
+      assert.match(guidance, /User requests do not override the class ceiling/);
+    }
+
+    ctx.model = { provider: "unknown-provider", id: "model" };
+    fake.fire("before_agent_start", event, ctx);
+    const unknownProviderGuidance = event.systemPromptOptions.sections.subagent_model_selection;
+    assert.match(unknownProviderGuidance, /Never use a subagent above the main agent's model class/);
+    assert.doesNotMatch(unknownProviderGuidance, /Astra > Sol > Luna|Fable > Opus > Sonnet/);
+  });
+
   it("refreshes spawn guidance when the active provider changes", () => {
     const fake = registerAll();
     const event = { systemPromptOptions: { sections: {} as Record<string, string> } };

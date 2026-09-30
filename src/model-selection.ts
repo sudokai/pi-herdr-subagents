@@ -22,9 +22,21 @@ export interface SubagentModelContext {
   };
 }
 
-/** Task-complexity guidance applies only to these exact parent models. */
+/** Caps subagent model classes; task-complexity recommendations use exact parent IDs. */
 export function getSubagentDelegationGuidance(parentModel?: { provider: string; id: string }): string {
-  if (!parentModel) return "";
+  const classCeiling =
+    "Never use a subagent above the main agent's model class. " +
+    "Choose the same class or a lower class within the selected model family. " +
+    "Do not assume equivalence between families; if the class comparison is uncertain, keep the work on the main agent. " +
+    "User requests do not override the class ceiling or scope restrictions. ";
+  if (!parentModel) return classCeiling;
+  const familyHierarchy =
+    parentModel.provider === "openai-codex"
+      ? "Model classes, highest to lowest: Astra > Sol > Luna. "
+      : parentModel.provider === "anthropic"
+        ? "Model classes, highest to lowest: Fable > Opus > Sonnet. "
+        : "";
+  const classGuidance = classCeiling.replace("Choose the same class", `${familyHierarchy}Choose the same class`);
   let everydayModel: string;
   let judgmentModel: string;
   if (parentModel.provider === "openai-codex" && parentModel.id === "gpt-6.1-sol") {
@@ -34,14 +46,15 @@ export function getSubagentDelegationGuidance(parentModel?: { provider: string; 
     everydayModel = "anthropic/claude-sonnet-5.5";
     judgmentModel = "anthropic/claude-opus-5.5";
   } else {
-    return "";
+    return classGuidance;
   }
   return (
+    classGuidance +
     `Use ${everydayModel} subagents only for well-scoped everyday tasks, such as localized bug fixes and rapid feature iteration with clear acceptance criteria. ` +
     `For complex work requiring careful judgment, keep the work on the main agent or delegate to ${judgmentModel}. ` +
     `If uncertain, do not delegate to ${everydayModel}. ` +
     "If the recommended model is outside the current scope, keep the work on the main agent rather than substitute another model. " +
-    "Explicit user requests override this guidance, but not scope restrictions."
+    "Explicit user requests override task-complexity recommendations, but not scope restrictions or the class ceiling."
   );
 }
 

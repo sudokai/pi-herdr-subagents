@@ -10,5 +10,7 @@
 
 - **Apply task-complexity guidance to exact parent model IDs** — Sol 6.1 prefers Luna 6 for well-scoped everyday work; Opus 5.5 prefers Sonnet 5.5. Complex or uncertain work stays on the parent or uses the parent model. User requests override this guidance, but scope validation is unchanged.
 
+- **Keep the class ceiling general and name hierarchies only for known families** — show Astra > Sol > Luna for `openai-codex` and Fable > Opus > Sonnet for `anthropic`; omit named hierarchies for unknown providers or missing model identity. User requests cannot override the ceiling, and uncertain cross-family comparisons stay on the main agent. This changes guidance only; catalog behavior and runtime scope validation remain unchanged.
+
 ## Deviations
 - **Read `ctx.scopedModels` structurally** — the installed pi extension declarations do not yet expose this property, so the integration reads it through a local context type while retaining the supported `getAvailable()` fallback.
